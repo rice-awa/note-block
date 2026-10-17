@@ -134,6 +134,8 @@ function sameNotes(a: Note[], b: Note[]): boolean {
 function applyState(next: SongStateInput, animate = false): void {
   // 旧调用只给 notes/bpm/infinite：归一化补 bars/loop，不切掉任何音符
   const state = normalizeState(next);
+  // 整首替换（撤销 / 载入示例）时先停播，否则时钟继续走、HUD 却显示暂停
+  if (clock.playing) clock.pause();
   infinite = state.infinite;
   bars = state.bars;
   loop = state.loop;
@@ -504,6 +506,13 @@ function loadExample(example: Example): void {
     },
     true,
   );
+  // 示例一律从头开始：不自动播放，也不继承上一首的播放位置
+  clock.rewind();
+  studio.setWindow(0, true);
+  hud.setPlaying(false);
+  hud.setAtEnd(false);
+  hud.setStep(0);
+  hud.setProgress(0, clock.length);
   examplePanel?.refresh();
   hud.showToast(`已载入《${example.name}》`, '撤销', () => undo(true), 5600);
   hud.dismissHint();

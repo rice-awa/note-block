@@ -167,6 +167,10 @@ export class Studio {
     left: new Spring(0, 0.35, 0.9),
     right: new Spring(0, 0.35, 0.9),
   };
+  /** 手柄沿屏幕外法线的角度（弧度）：命中区跟着转，避免压住网格 */
+  private readonly handleAngle: Record<HandleSide, number> = { left: 0, right: 0 };
+  /** 触屏命中区 44px，与 CSS @media (pointer: coarse) 对齐 */
+  private coarse = false;
   private handleNear: HandleSide | null = null;
   private resizeDrag: {
     side: HandleSide;
@@ -237,6 +241,7 @@ export class Studio {
     this.buildStage();
     this.buildProps();
     this.buildHandles();
+    this.coarse = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
     this.resize();
   }
 
@@ -495,7 +500,8 @@ export class Studio {
     this.caps = new THREE.InstancedMesh(
       new RoundedBoxGeometry(0.84, 0.035, 0.84, 2, 0.018),
       new THREE.MeshStandardMaterial({ roughness: 0.42, metalness: 0.02 }),
-      256,
+      // W=32 时窗口含 ±1 列最多 272 块，留余量避免越界写实例
+      320,
     );
     this.caps.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.caps.frustumCulled = false;
@@ -519,7 +525,7 @@ export class Studio {
     this.blobs = new THREE.InstancedMesh(
       new THREE.PlaneGeometry(1.5, 1.5),
       new THREE.MeshBasicMaterial({ map: blobTex, transparent: true, depthWrite: false, opacity: 0.5 }),
-      256,
+      320,
     );
     this.blobs.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.blobs.frustumCulled = false;
@@ -1251,12 +1257,22 @@ export class Studio {
     this.paintHandleState();
   }
 
-  /** 手柄命中判定：石板边缘 26 × 128 px 的加宽区（触屏由 DOM 44px 命中区兜底） */
+  /**
+   * 手柄命中判定：手柄盒沿屏幕外法线摆放，用自身局部坐标判断，
+   * 内侧边正好落在石板边缘，命中区不侵入网格。
+   */
   hitResizeHandle(e: ScreenPoint): HandleSide | null {
     if (!this.handles) return null;
+    const half = this.coarse ? 22 : 13;
+    const halfH = this.coarse ? 80 : 64;
     for (const side of ['left', 'right'] as const) {
       const p = this.handleScreen[side];
-      if (Math.abs(e.clientX - p.x) <= 26 && Math.abs(e.clientY - p.y) <= 64) return side;
+      const a = this.handleAngle[side];
+      const dx = e.clientX - p.x;
+      const dy = e.clientY - p.y;
+      const along = dx * Math.cos(a) + dy * Math.sin(a);
+      const perp = -dx * Math.sin(a) + dy * Math.cos(a);
+      if (Math.abs(along) <= half && Math.abs(perp) <= halfH) return side;
     }
     return null;
   }
@@ -1395,24 +1411,38 @@ export class Studio {
     if (!this.handles) return;
     const y = -0.33; // 石板侧面中点高度
     const r = this.resizeDrag;
+    const half = this.coarse ? 22 : 13; // 与 CSS 26 / 44px 命中区对齐
     for (const side of ['left', 'right'] as const) {
       const sign = side === 'left' ? -1 : 1;
-      // 网格边缘（18px 淡入判定的基准）
-      this.edgeScreen[side] = this.projectWorld(sign * this.halfW, y, 0);
-      // 手柄中心挂在石板边缘（网格外 0.9 格），命中区不侵入网格
-      const back = this.projectWorld(sign * (this.halfW + HANDLE_EDGE_PAD), y, 0);
+      // 石板边缘中点：手柄贴着它，向外展开半个命中区
+      const anchor = this.projectWorld(sign * (this.halfW + HANDLE_EDGE_PAD), y, 0);
+      this.edgeScreen[side] = anchor;
+      // 屏幕空间外法线：沿世界 x 再向外一格投影取方向（竖屏旋转下也正确）
+      const outer = this.projectWorld(sign * (this.halfW + HANDLE_EDGE_PAD + 1), y, 0);
+      const vx = outer.x - anchor.x;
+      const vy = outer.y - anchor.y;
+      const len = Math.hypot(vx, vy) || 1;
+      const nx = vx / len;
+      const ny = vy / len;
+      this.handleAngle[side] = Math.atan2(ny, nx);
+
       const spring = this.handleSpring[side];
       if (r && r.side === side) {
         // 拖动中手柄跟"想要"的宽度走（连续），棋盘按 4 列吸附（离散）
         const raw = clamp(r.rawHalfW, WINDOW_COLS_MIN / 2, WINDOW_COLS_MAX / 2 + 2);
         const finger = this.projectWorld(sign * (raw + HANDLE_EDGE_PAD), y, 0);
-        spring.snap(finger.x - back.x);
+        spring.snap(Math.hypot(finger.x - anchor.x, finger.y - anchor.y));
       } else {
         spring.update(dt);
       }
-      const x = back.x + spring.value;
-      this.handleScreen[side] = { x, y: back.y };
-      this.handles[side].style.transform = `translate3d(${x}px, ${back.y}px, 0) translate(-50%, -50%)`;
+
+      const dist = half + spring.value;
+      const cx = anchor.x + nx * dist;
+      const cy = anchor.y + ny * dist;
+      this.handleScreen[side] = { x: cx, y: cy };
+      const deg = (this.handleAngle[side] * 180) / Math.PI;
+      this.handles[side].style.transform =
+        `translate3d(${cx}px, ${cy}px, 0) translate(-50%, -50%) rotate(${deg}deg)`;
     }
   }
 
