@@ -31,6 +31,17 @@ export interface Cell {
   row: number;
 }
 
+/** 绘制落格：格内按 floor 取整，并带回地板平面的局部 z（行滞回要用） */
+export interface PaintCell extends Cell {
+  lz: number;
+}
+
+/** 只需要屏幕坐标的事件（指针 / 滚轮 / 测试里构造的点） */
+export interface ScreenPoint {
+  clientX: number;
+  clientY: number;
+}
+
 export interface BlockView {
   step: number;
   row: number;
@@ -471,8 +482,8 @@ export class Studio {
   }
 
   /** QA / 调试：把某个格子中心投到画布 CSS 像素坐标（y=0 是地板拾取面） */
-  cellToScreen(step: number, row: number, y = BLOCK_Y): { x: number; y: number } {
-    const v = new THREE.Vector3(cellX(step), y, cellZ(row));
+  cellToScreen(step: number, row: number, y = BLOCK_Y, zf = 0.5): { x: number; y: number } {
+    const v = new THREE.Vector3(cellX(step), y, Z0 + row + zf);
     this.songGroup.localToWorld(v);
     this.camera.updateMatrixWorld();
     v.project(this.camera);
@@ -483,7 +494,17 @@ export class Studio {
     };
   }
 
-  addBlock(step: number, row: number, midi = BASE_MIDI, animated = true, delay?: number): BlockView | null {
+  /**
+   * 新增方块。pop = 笔触落子：贴地出现，只做 0.85 → 1 的缩放，不走高空落下。
+   */
+  addBlock(
+    step: number,
+    row: number,
+    midi = BASE_MIDI,
+    animated = true,
+    delay?: number,
+    pop = false,
+  ): BlockView | null {
     if (step < 0 || step >= MAX_STEPS || row < 0 || row >= ROW_COUNT) return null;
     if (this.blockAt(step, row)) return null;
     const rowDef = ROWS[row];
@@ -510,7 +531,7 @@ export class Studio {
 
     const x = cellX(step);
     const z = cellZ(row);
-    const y = animated ? 2.6 : BLOCK_Y;
+    const y = pop ? BLOCK_Y : animated ? 2.6 : BLOCK_Y;
     mesh.position.set(x, y, z);
 
     const block: BlockView = {
@@ -519,12 +540,12 @@ export class Studio {
       midi,
       mesh,
       mat,
-      sx: new Spring(x, 0.3, 0.85),
-      sy: new Spring(y, 0.26, 0.66),
-      sz: new Spring(z, 0.3, 0.85),
-      ss: new Spring(animated ? 0.2 : 1, 0.32, 0.8),
+      sx: new Spring(x, pop ? 0.2 : 0.3, 0.85),
+      sy: new Spring(y, pop ? 0.2 : 0.26, pop ? 0.9 : 0.66),
+      sz: new Spring(z, pop ? 0.2 : 0.3, 0.85),
+      ss: new Spring(pop ? 0.85 : animated ? 0.2 : 1, pop ? 0.2 : 0.32, pop ? 0.9 : 0.8),
       glow: 0,
-      delay: delay ?? (animated ? Math.min(0.55, (row * 0.55 + (step % 16)) * 0.012 + 0.15) : 0),
+      delay: pop ? 0 : (delay ?? (animated ? Math.min(0.55, (row * 0.55 + (step % 16)) * 0.012 + 0.15) : 0)),
       dragging: false,
       tiltX: 0,
       tiltZ: 0,
@@ -535,7 +556,9 @@ export class Studio {
     this.blocks.set(this.key(step, row), block);
     this.indexBlock(block);
 
-    if (animated) {
+    if (pop) {
+      block.ss.setTarget(1);
+    } else if (animated) {
       block.sy.setTarget(BLOCK_Y, -1.5);
       block.ss.setTarget(1);
     }
@@ -771,12 +794,12 @@ export class Studio {
 
   // ---------------------------------------------------------------- picking
 
-  private setNDC(e: PointerEvent | WheelEvent | MouseEvent): void {
+  private setNDC(e: ScreenPoint): void {
     const rect = this.canvas.getBoundingClientRect();
     this.ndc.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
   }
 
-  private pointOnPlane(e: PointerEvent | WheelEvent | MouseEvent, y: number): THREE.Vector3 | null {
+  private pointOnPlane(e: ScreenPoint, y: number): THREE.Vector3 | null {
     this.setNDC(e);
     this.raycaster.setFromCamera(this.ndc, this.camera);
     this.dragPlane.constant = -y;
@@ -784,7 +807,7 @@ export class Studio {
     return hit ? this.dragPoint.clone() : null;
   }
 
-  pointerToCell(e: PointerEvent | WheelEvent | MouseEvent): Cell | null {
+  pointerToCell(e: ScreenPoint): Cell | null {
     const p = this.pointOnPlane(e, 0);
     if (!p) return null;
     const localX = p.x + this.viewStart;
@@ -800,7 +823,44 @@ export class Studio {
     return { step, row };
   }
 
-  pickBlock(e: PointerEvent | WheelEvent | MouseEvent): BlockView | null {
+  /**
+   * 绘制落格：地板平面求交后按格取整（floor），并把局部 z 带出来给行滞回用。
+   * 与 pointerToCell 的区别只在格内取整方式；舞台边界判定一致。
+   */
+  pointerToCellExact(e: ScreenPoint): PaintCell | null {
+    return this.pointerToCellExactAt(e, this.viewStart);
+  }
+
+  /** 同上，但按指定窗口左缘求格：自动滚动时用目标窗口位置继续笔触 */
+  pointerToCellExactAt(e: ScreenPoint, viewStart: number): PaintCell | null {
+    const p = this.pointOnPlane(e, 0);
+    if (!p) return null;
+    const localX = p.x + viewStart;
+    const step = Math.floor(localX - X0);
+    const row = Math.floor(p.z - Z0);
+    if (step < 0 || step >= MAX_STEPS || row < 0 || row >= ROW_COUNT) return null;
+    const stageX = p.x;
+    if (stageX < X0 - 0.5 || stageX > X0 + WINDOW + 0.5) return null;
+    const first = Math.floor(viewStart);
+    const last = Math.floor(viewStart + WINDOW - 1);
+    if (step < first || step > last) return null;
+    return { step, row, lz: p.z };
+  }
+
+  /**
+   * 行滞回：换行要越过相邻行的中线（半格），手抖不会串音色。
+   * current 为 null 时直接取指针所在行。
+   */
+  rowWithHysteresis(lz: number, current: number | null): number {
+    const local = lz - Z0;
+    const raw = clamp(Math.floor(local), 0, ROW_COUNT - 1);
+    if (current === null) return raw;
+    if (raw === current) return current;
+    if (raw > current) return local >= current + 1.5 ? raw : current;
+    return local <= current - 0.5 ? raw : current;
+  }
+
+  pickBlock(e: ScreenPoint): BlockView | null {
     this.setNDC(e);
     this.raycaster.setFromCamera(this.ndc, this.camera);
     const hits = this.raycaster.intersectObjects(this.blockGroup.children, false);

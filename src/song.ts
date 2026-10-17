@@ -263,6 +263,15 @@ export class History {
     return this.redoStack.length > 0;
   }
 
+  /** 调试 / QA：当前可撤销的条目数 */
+  get undoDepth(): number {
+    return this.undoStack.length;
+  }
+
+  get redoDepth(): number {
+    return this.redoStack.length;
+  }
+
   /** 修改前记录；同 key 且距上次记录 <900ms 时跳过（如滚轮连续改音高） */
   record(state: SongState, coalesceKey?: string): void {
     const now = Date.now();

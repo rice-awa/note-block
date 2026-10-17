@@ -2,7 +2,7 @@ import './style.css';
 import { AudioEngine, Clock } from './audio';
 import { Hud } from './hud';
 import { COLS, DEMO, MAX_MIDI, MIN_MIDI, ROWS } from './rows';
-import { Studio, type BlockView } from './scene';
+import { Studio, type BlockView, type Cell, type PaintCell } from './scene';
 import {
   decodeSong,
   History,
@@ -277,6 +277,49 @@ if (sharedState) {
 let orbit: { x: number; y: number } | null = null;
 let hoverBlock: BlockView | null = null;
 
+type StrokeMode = 'paint' | 'erase';
+
+/** 一笔：paint 记新增，erase 记删除；松手时若真的改了曲子才压一次历史 */
+interface Stroke {
+  mode: StrokeMode;
+  before: SongState;
+  startRow: number;
+  row: number;
+  lastStep: number;
+  lastRow: number;
+  added: number;
+  removed: number;
+  pointerId: number;
+  clientX: number;
+  clientY: number;
+  shift: boolean;
+}
+
+const PAINT_MIDI = 12;
+/** 单次 pointermove 最多补的格数，防止异常事件刷爆 */
+const MOVE_LIMIT = 32;
+/** 同一批补格最多发声的数量，其余交给压缩器兜底 */
+const SOUND_LIMIT = 8;
+/** 画到窗口右缘后停留多久开始自动前移 */
+const EDGE_HOLD_MS = 120;
+
+let stroke: Stroke | null = null;
+let edgeTimer = 0;
+let edgeArmed = false;
+let suppressContextUntil = 0;
+
+const touchPoints = new Map<number, { x: number; y: number }>();
+let pinch: { cx: number; cy: number; dist: number } | null = null;
+
+/** 指针捕获：合成事件（自动化测试）没有真实 pointerId，捕获失败不应打断笔触 */
+function capturePointer(id: number): void {
+  try {
+    canvas.setPointerCapture(id);
+  } catch {
+    /* ignored */
+  }
+}
+
 function updateHover(e: PointerEvent): void {
   if (studio.isDragging) {
     studio.setHover(studio.dragTargetCell(), false);
@@ -290,41 +333,283 @@ function updateHover(e: PointerEvent): void {
   else canvas.style.cursor = 'default';
 }
 
+/** 上一格到当前格的网格插值：Bresenham，去掉起点、保留终点，最多 32 格 */
+function lineCells(sx: number, sy: number, ex: number, ey: number): Cell[] {
+  const cells: Cell[] = [];
+  let x = sx;
+  let y = sy;
+  const dx = Math.abs(ex - sx);
+  const dy = -Math.abs(ey - sy);
+  const ux = sx < ex ? 1 : sx > ex ? -1 : 0;
+  const uy = sy < ey ? 1 : sy > ey ? -1 : 0;
+  let err = dx + dy;
+  while ((x !== ex || y !== ey) && cells.length < MOVE_LIMIT) {
+    const e2 = 2 * err;
+    if (e2 >= dy) {
+      err += dy;
+      x += ux;
+    }
+    if (e2 <= dx) {
+      err += dx;
+      y += uy;
+    }
+    cells.push({ step: x, row: y });
+  }
+  return cells;
+}
+
+/** 补格：跳过已占用格；每格发声，同一批只发前 8 格 */
+function paintCells(cells: Cell[]): number {
+  let added = 0;
+  let sounded = 0;
+  for (const cell of cells) {
+    if (cell.step < 0 || cell.step >= MAX_STEPS) break;
+    if (studio.blockAt(cell.step, cell.row)) continue;
+    if (!studio.addBlock(cell.step, cell.row, PAINT_MIDI, false, 0, true)) continue;
+    added++;
+    if (sounded < SOUND_LIMIT && !mutedRows.has(cell.row)) {
+      audio.play(voice(cell.row), PAINT_MIDI, 0, 0.3);
+      sounded++;
+    }
+  }
+  return added;
+}
+
+function startStroke(e: PointerEvent, mode: StrokeMode, step: number, row: number): void {
+  stroke = {
+    mode,
+    before: capture(),
+    startRow: row,
+    row,
+    lastStep: step,
+    lastRow: row,
+    added: 0,
+    removed: 0,
+    pointerId: e.pointerId,
+    clientX: e.clientX,
+    clientY: e.clientY,
+    shift: e.shiftKey,
+  };
+  capturePointer(e.pointerId);
+  hud.hideToast();
+  hud.dismissHint();
+}
+
+function startPaint(e: PointerEvent, exact: PaintCell): void {
+  startStroke(e, 'paint', exact.step, exact.row);
+  canvas.style.cursor = 'crosshair';
+  audio.sfx('sfx_place', 0, 1.2, 0.22);
+  const added = paintCells([{ step: exact.step, row: exact.row }]);
+  if (stroke) stroke.added += added;
+  studio.setHover({ step: exact.step, row: exact.row }, false);
+  if (added) {
+    syncLength();
+    markDirty();
+  }
+  armEdgeScroll();
+}
+
+/** 笔触继续：行跟随指针（半格滞回）或 Shift 锁定起始行，中间格补齐 */
+function advancePaint(exact: PaintCell, shift: boolean): void {
+  const s = stroke;
+  if (!s || s.mode !== 'paint') return;
+  const row = shift ? s.startRow : studio.rowWithHysteresis(exact.lz, s.row);
+  const cells = lineCells(s.lastStep, s.lastRow, exact.step, row);
+  const added = cells.length ? paintCells(cells) : 0;
+  s.added += added;
+  s.row = row;
+  s.lastStep = exact.step;
+  s.lastRow = row;
+  s.shift = shift;
+  studio.setHover({ step: exact.step, row }, false);
+  if (added) {
+    syncLength();
+    markDirty();
+  }
+  armEdgeScroll();
+}
+
+function eraseCell(step: number, row: number, sound: boolean): number {
+  if (!studio.blockAt(step, row)) return 0;
+  if (sound) audio.sfx('sfx_break', 0, 1, 0.34);
+  studio.removeBlock(step, row);
+  return 1;
+}
+
+function startErase(e: PointerEvent): void {
+  const exact = studio.pointerToCellExact(e);
+  const block = studio.pickBlock(e);
+  if (!exact && !block) return;
+  const step = exact ? exact.step : block!.step;
+  const row = exact ? exact.row : block!.row;
+  startStroke(e, 'erase', step, row);
+  suppressContextUntil = performance.now() + 800;
+  canvas.style.cursor = 'crosshair';
+  let removed = eraseCell(step, row, true);
+  // 透视下拾取到的是悬空方块，与地板格不同格时两处都擦
+  if (block && (block.step !== step || block.row !== row)) removed += eraseCell(block.step, block.row, true);
+  if (stroke) stroke.removed += removed;
+  studio.setHover({ step, row }, false);
+  if (removed) {
+    syncLength();
+    markDirty();
+  }
+}
+
+function advanceErase(exact: PaintCell): void {
+  const s = stroke;
+  if (!s || s.mode !== 'erase') return;
+  const cells = lineCells(s.lastStep, s.lastRow, exact.step, exact.row);
+  let removed = 0;
+  let sounded = 0;
+  for (const cell of cells) {
+    if (!studio.blockAt(cell.step, cell.row)) continue;
+    const sound = sounded < 3;
+    removed += eraseCell(cell.step, cell.row, sound);
+    if (sound) sounded++;
+  }
+  s.removed += removed;
+  s.lastStep = exact.step;
+  s.lastRow = exact.row;
+  studio.setHover({ step: exact.step, row: exact.row }, false);
+  if (removed) {
+    syncLength();
+    markDirty();
+  }
+}
+
+function finishStroke(): void {
+  const s = stroke;
+  stroke = null;
+  disarmEdge();
+  canvas.style.cursor = 'default';
+  if (!s) return;
+  if (s.mode === 'paint' ? s.added > 0 : s.removed > 0) history.push(s.before);
+  studio.setHover(null);
+  syncLength();
+  markDirty();
+}
+
+function paintMove(e: PointerEvent): void {
+  const s = stroke;
+  if (!s) return;
+  s.clientX = e.clientX;
+  s.clientY = e.clientY;
+  s.shift = e.shiftKey;
+  const exact = studio.pointerToCellExact(e);
+  if (!exact) {
+    disarmEdge();
+    return;
+  }
+  if (s.mode === 'paint') advancePaint(exact, s.shift);
+  else advanceErase(exact);
+}
+
+function disarmEdge(): void {
+  if (edgeTimer) {
+    window.clearTimeout(edgeTimer);
+    edgeTimer = 0;
+  }
+  edgeArmed = false;
+}
+
+/**
+ * 画到窗口右缘 1 列内并停留 120ms：窗口前移 1 列，笔触继续。
+ * 前移后同一屏幕位置对应的步数 +1，正好落在新的最右列上，所以不用重算光标。
+ */
+function armEdgeScroll(): void {
+  const s = stroke;
+  if (!s || s.mode !== 'paint' || !infinite) {
+    disarmEdge();
+    return;
+  }
+  const lastCol = Math.floor(studio.windowTarget + WINDOW - 1);
+  if (s.lastStep < lastCol - 1) {
+    disarmEdge();
+    return;
+  }
+  if (edgeArmed) return;
+  edgeArmed = true;
+  edgeTimer = window.setTimeout(() => {
+    edgeTimer = 0;
+    edgeArmed = false;
+    const p = stroke;
+    if (!p || p.mode !== 'paint' || !infinite) return;
+    if (studio.windowTarget >= MAX_STEPS - WINDOW) return;
+    studio.setWindow(studio.windowTarget + 1);
+    const exact = studio.pointerToCellExactAt({ clientX: p.clientX, clientY: p.clientY }, studio.windowTarget);
+    if (exact) advancePaint(exact, p.shift);
+    armEdgeScroll();
+  }, EDGE_HOLD_MS);
+}
+
+function pinchFromTouches(): { cx: number; cy: number; dist: number } | null {
+  if (touchPoints.size < 2) return null;
+  const [a, b] = [...touchPoints.values()];
+  return {
+    cx: (a.x + b.x) / 2,
+    cy: (a.y + b.y) / 2,
+    dist: Math.hypot(a.x - b.x, a.y - b.y),
+  };
+}
+
 canvas.addEventListener('pointerdown', (e) => {
   void unlock();
+  if (e.pointerType === 'touch') {
+    touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (touchPoints.size >= 2) {
+      // 双指：结束笔触，进入 orbit / 捏合
+      if (stroke) finishStroke();
+      if (studio.isDragging) commitDrag();
+      orbit = null;
+      pinch = pinchFromTouches();
+      capturePointer(e.pointerId);
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+  }
+  if (e.button === 2) {
+    if (!stroke && !studio.isDragging) startErase(e);
+    return;
+  }
   if (e.button !== 0) return;
   hud.dismissHint();
 
   const block = studio.pickBlock(e);
-  if (block) {
+  if (block && !stroke) {
     dragPre = capture();
     studio.beginDrag(block, e);
-    canvas.setPointerCapture(e.pointerId);
+    capturePointer(e.pointerId);
     canvas.style.cursor = 'grabbing';
     return;
   }
 
-  const cell = studio.pointerToCell(e);
-  if (cell) {
-    record();
-    const created = studio.addBlock(cell.step, cell.row, 12, false);
-    if (created) {
-      studio.beginDrag(created, e);
-      canvas.setPointerCapture(e.pointerId);
-      audio.sfx('sfx_place', 0, 1.15, 0.4);
-      audio.play(voice(cell.row), 12, 0, 0.7);
-      syncLength();
-      markDirty();
-    }
+  const exact = studio.pointerToCellExact(e);
+  if (exact && !stroke) {
+    startPaint(e, exact);
     return;
   }
 
-  orbit = { x: e.clientX, y: e.clientY };
-  canvas.setPointerCapture(e.pointerId);
-  canvas.style.cursor = 'grabbing';
+  if (!stroke) {
+    orbit = { x: e.clientX, y: e.clientY };
+    capturePointer(e.pointerId);
+    canvas.style.cursor = 'grabbing';
+  }
 });
 
 canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerType === 'touch' && touchPoints.has(e.pointerId)) {
+    touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pinch && touchPoints.size >= 2) {
+      const next = pinchFromTouches();
+      if (next) {
+        studio.orbit(next.cx - pinch.cx, next.cy - pinch.cy);
+        if (Math.abs(next.dist - pinch.dist) > 2) studio.zoom((pinch.dist - next.dist) * 0.16);
+        pinch = next;
+      }
+      return;
+    }
+  }
   studio.parallax(e);
   if (studio.isDragging) {
     studio.dragTo(e);
@@ -336,37 +621,50 @@ canvas.addEventListener('pointermove', (e) => {
     orbit = { x: e.clientX, y: e.clientY };
     return;
   }
+  if (stroke) {
+    paintMove(e);
+    return;
+  }
   updateHover(e);
 });
 
-function endPointer(e: PointerEvent): void {
-  if (studio.isDragging) {
-    const before = dragPre;
-    const drop = studio.dragTargetCell();
-    const { removed } = studio.endDrag();
-    const after = capture();
-    if (before && (removed || !sameNotes(before.notes, after.notes))) history.push(before);
-    dragPre = null;
-    audio.sfx(removed ? 'sfx_break' : 'sfx_place', 0, removed ? 0.95 : 0.85, removed ? 0.5 : 0.28);
-    canvas.style.cursor = 'default';
-    // 写到窗口最右一列：松手后让出 4 列，像翻页
-    if (infinite && !removed && drop && drop.step >= studio.windowStart + WINDOW - 1) {
-      studio.setWindow(studio.windowTarget + 4);
-    }
-    syncLength();
-    markDirty();
-    updateHover(e);
+/** 块拖动落定：动量、选格、交换、越界删除；返回是否删除 */
+function commitDrag(): { removed: boolean; drop: Cell | null } {
+  const before = dragPre;
+  const drop = studio.dragTargetCell();
+  const { removed } = studio.endDrag();
+  const after = capture();
+  if (before && (removed || !sameNotes(before.notes, after.notes))) history.push(before);
+  dragPre = null;
+  audio.sfx(removed ? 'sfx_break' : 'sfx_place', 0, removed ? 0.95 : 0.85, removed ? 0.5 : 0.28);
+  canvas.style.cursor = 'default';
+  // 拖到窗口最右一列：松手后让出 4 列，像翻页
+  if (infinite && !removed && drop && drop.step >= studio.windowStart + WINDOW - 1) {
+    studio.setWindow(studio.windowTarget + 4);
   }
+  syncLength();
+  markDirty();
+  return { removed, drop };
+}
+
+function endPointer(e: PointerEvent): void {
+  if (e.pointerType === 'touch') {
+    touchPoints.delete(e.pointerId);
+    if (touchPoints.size < 2) pinch = null;
+  }
+  if (stroke) finishStroke();
+  if (studio.isDragging) commitDrag();
   if (orbit) {
     orbit = null;
     canvas.style.cursor = 'default';
   }
+  if (!stroke && !studio.isDragging && !orbit) updateHover(e);
 }
 
 canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
 canvas.addEventListener('pointerleave', () => {
-  if (!studio.isDragging) {
+  if (!studio.isDragging && !stroke) {
     studio.setHover(null);
     hoverBlock = null;
   }
@@ -376,6 +674,7 @@ canvas.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault();
+    if (stroke) return;
     const block = studio.pickBlock(e);
     if (block && !studio.isDragging) {
       const dir = e.deltaY > 0 ? -1 : 1;
@@ -403,6 +702,8 @@ canvas.addEventListener(
 
 canvas.addEventListener('contextmenu', (e) => {
   e.preventDefault();
+  // 右键按下已经进入连续擦除，这一次 contextmenu 不再重复删
+  if (performance.now() < suppressContextUntil) return;
   const block = studio.pickBlock(e);
   if (!block) return;
   record();
