@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>NOTE BLOCK · 音符方块</title>
+    <meta
+      name="description"
+      content="一块 16×8 的体素舞台就是钢琴卷。拖动方块作曲，听见 Minecraft 的音符盒，看见 D 大调的光。"
+    />
+    <meta name="theme-color" content="#f5f0e6" />
+    <meta property="og:title" content="NOTE BLOCK · 音符方块" />
+    <meta property="og:description" content="一台用 Minecraft 语法写成、用 Apple 手感演奏的 3D 合成器。" />
+    <meta property="og:type" content="website" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpolygon points='9,1.5 16.5,5.8 9,10.1 1.5,5.8' fill='%238CC152'/%3E%3Cpolygon points='16.5,5.8 16.5,12.6 9,16.9 9,10.1' fill='%236E9C43'/%3E%3Cpolygon points='1.5,5.8 1.5,12.6 9,16.9 9,10.1' fill='%235B8236'/%3E%3C/svg%3E"
+    />
+    <link rel="preload" href="/fonts/inter.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/mono.woff2" as="font" type="font/woff2" crossorigin />
+  </head>
+  <body>
+    <canvas id="scene" aria-label="体素合成器舞台：16 列时间、8 行材质的音符网格"></canvas>
+    <div id="vignette" aria-hidden="true"></div>
+    <div id="grain" aria-hidden="true"></div>
+    <div id="veil" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-cube" viewBox="0 0 18 18" aria-hidden="true">
+          <polygon points="9,1.5 16.5,5.8 9,10.1 1.5,5.8" fill="#8CC152" />
+          <polygon points="16.5,5.8 16.5,12.6 9,16.9 9,10.1" fill="#6E9C43" />
+          <polygon points="1.5,5.8 1.5,12.6 9,16.9 9,10.1" fill="#5B8236" />
+        </svg>
+        <span class="brand-name">NOTE BLOCK</span>
+        <span class="brand-sub">音符方块</span>
+      </div>
+      <div class="top-actions">
+        <button id="sound" class="icon-btn" type="button" aria-label="静音">
+          <svg class="ico ico-on" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 9.4h3.1L11.6 6v12L7.1 14.6H4z" fill="currentColor" />
+            <path d="M14.8 8.6a5 5 0 0 1 0 6.8" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" />
+            <path d="M17.6 6.2a8.6 8.6 0 0 1 0 11.6" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" opacity=".45" />
+          </svg>
+          <svg class="ico ico-off" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 9.4h3.1L11.6 6v12L7.1 14.6H4z" fill="currentColor" />
+            <path d="M15 9.5l5 5M20 9.5l-5 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" />
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <div id="rows" class="rows" role="group" aria-label="八种地板材质，点击静音"></div>
+
+    <div id="hint" class="hint">
+      <span class="hint-line"><b>拖动方块</b> 作曲</span>
+      <span class="hint-sub">滚轮改音高 · 右键删除 · 空格播放</span>
+    </div>
+
+    <footer class="transport" aria-label="播放控制">
+      <button id="play" class="play" type="button" aria-label="播放">
+        <svg class="ico-play" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M11.5 6.5v19L26 16z" fill="currentColor" />
+        </svg>
+        <svg class="ico-pause" viewBox="0 0 32 32" aria-hidden="true">
+          <rect x="9.2" y="6.5" width="4.6" height="19" rx="1.4" fill="currentColor" />
+          <rect x="18.2" y="6.5" width="4.6" height="19" rx="1.4" fill="currentColor" />
+        </svg>
+      </button>
+      <div class="divider" aria-hidden="true"></div>
+      <div class="bpm">
+        <div class="bpm-num"><span id="bpm">108</span><em>BPM</em></div>
+        <div class="bpm-ctl">
+          <button type="button" data-bpm="-1" aria-label="减慢速度">−</button>
+          <button type="button" data-bpm="1" aria-label="加快速度">＋</button>
+        </div>
+      </div>
+      <div class="divider" aria-hidden="true"></div>
+      <div class="key">
+        <span class="key-name">D 大调</span>
+        <span class="key-sub">五声音阶</span>
+      </div>
+      <div class="divider" aria-hidden="true"></div>
+      <div id="steps" class="steps" aria-hidden="true"></div>
+    </footer>
+
+    <p class="legal">本项目与 Mojang / Microsoft 无关。</p>
+
+    <noscript>这台乐器需要 JavaScript。</noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

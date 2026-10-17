@@ -1,0 +1,20 @@
+# NOTICE
+
+The MIT license in [LICENSE](LICENSE) covers the source code of NOTE BLOCK.
+
+It does **not** cover the third-party assets below:
+
+- `public/tex/*.png` — Minecraft block textures, © Mojang Studios / Microsoft.
+  Sourced from [InventivetalentDev/minecraft-assets](https://github.com/InventivetalentDev/minecraft-assets) 1.20.1.
+- `public/audio/*.wav` — Minecraft note block sounds, © Mojang Studios / Microsoft.
+  Sourced from the public [MCSounds](https://o.xbottle.top/mcsounds/) archive.
+- `public/fonts/*.woff2` — Inter and JetBrains Mono, each licensed under the
+  SIL Open Font License 1.1.
+
+These assets are included solely for personal, non-commercial demonstration.
+They are not licensed for redistribution by this project. If you fork or deploy
+this project publicly, replace them with your own textures and audio.
+
+NOTE BLOCK is an unofficial fan project. It is not affiliated with, endorsed by,
+or sponsored by Mojang Studios or Microsoft. Minecraft is a trademark of
+Mojang Studios.
