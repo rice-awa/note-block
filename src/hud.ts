@@ -12,6 +12,7 @@ export class Hud {
   onShare: (() => void) | null = null;
   onSeek: ((step: number) => void) | null = null;
   onRewind: (() => void) | null = null;
+  onSettings: (() => void) | null = null;
 
   private playBtn = document.querySelector<HTMLButtonElement>('#play')!;
   private rewindBtn = document.querySelector<HTMLButtonElement>('#rewind')!;
@@ -23,6 +24,7 @@ export class Hud {
   private infiniteBtn = document.querySelector<HTMLButtonElement>('#infinite')!;
   private clearBtn = document.querySelector<HTMLButtonElement>('#clear')!;
   private shareBtn = document.querySelector<HTMLButtonElement>('#share')!;
+  private settingsBtn = document.querySelector<HTMLButtonElement>('#settings')!;
   private measureEl = document.querySelector<HTMLElement>('#measure')!;
   private barsEl = document.querySelector<HTMLElement>('#bars')!;
   private rail = document.querySelector<HTMLElement>('#rail')!;
@@ -39,6 +41,7 @@ export class Hud {
 
   private length = 16;
   private position = 0;
+  private atEnd = false;
   private measureIndex = 0;
   private toastTimer = 0;
   private toastHandler: (() => void) | null = null;
@@ -53,6 +56,7 @@ export class Hud {
     this.infiniteBtn.addEventListener('click', () => this.onInfinite?.());
     this.clearBtn.addEventListener('click', () => this.onClear?.());
     this.shareBtn.addEventListener('click', () => this.onShare?.());
+    this.settingsBtn.addEventListener('click', () => this.onSettings?.());
     document.querySelectorAll<HTMLButtonElement>('[data-bpm]').forEach((btn) => {
       btn.addEventListener('click', () => this.onBpm?.(Number(btn.dataset.bpm)));
     });
@@ -138,7 +142,23 @@ export class Hud {
 
   setPlaying(playing: boolean): void {
     document.body.classList.toggle('is-playing', playing);
-    this.playBtn.setAttribute('aria-label', playing ? '暂停' : '播放');
+    if (playing) this.atEnd = false;
+    this.playBtn.setAttribute('aria-label', playing ? '暂停' : this.atEnd ? '从头播放' : '播放');
+  }
+
+  /** 非循环播到末尾：播放键语义变成「从头播」 */
+  setAtEnd(atEnd: boolean): void {
+    this.atEnd = atEnd;
+    this.playBtn.dataset.atEnd = String(atEnd);
+    if (!document.body.classList.contains('is-playing')) {
+      this.playBtn.setAttribute('aria-label', atEnd ? '从头播放' : '播放');
+    }
+  }
+
+  setSettingsOpen(open: boolean): void {
+    this.settingsBtn.classList.toggle('is-on', open);
+    this.settingsBtn.setAttribute('aria-expanded', String(open));
+    this.settingsBtn.setAttribute('aria-label', open ? '关闭设置' : '设置');
   }
 
   setBpm(bpm: number): void {

@@ -1,19 +1,25 @@
 import './style.css';
 import { AudioEngine, Clock } from './audio';
+import { ConfigPanel, type GesturePhase } from './config-panel';
+import { Drawer } from './drawer';
 import { Hud } from './hud';
+import { clampWindowCols, loadPrefs, savePrefs, type Prefs } from './prefs';
 import { COLS, DEMO, MAX_MIDI, MIN_MIDI, ROWS } from './rows';
 import { Studio, type BlockView, type Cell, type PaintCell } from './scene';
 import {
+  clampBars,
   decodeSong,
   History,
   loadLocal,
+  MAX_BARS,
   MAX_STEPS,
+  normalizeState,
   readShareCode,
   saveLocal,
   shareUrl,
-  songLength,
   type Note,
   type SongState,
+  type SongStateInput,
 } from './song';
 
 const MEASURE = 16;
@@ -25,19 +31,35 @@ const audio = new AudioEngine();
 const hud = new Hud();
 const history = new History(40);
 const mutedRows = new Set<number>();
+const prefs: Prefs = loadPrefs();
+
+audio.setMasterGain(prefs.masterGain);
+audio.setReverbSend(prefs.reverb);
 
 const voice = (row: number) => ({ sample: ROWS[row].sample, gain: ROWS[row].gain });
 
 // ---------------------------------------------------------------- state
 
 let infinite = false;
+/** 曲长（小节）：有限模式 = 时钟长度；无限模式随内容增长 */
+let bars = 1;
+/** 播完循环 / 停在末尾 */
+let loop = true;
 /** 手动平移时间轴时累计的偏移（步） */
 let viewOffset = 0;
 let prevPos = 0;
 let dragPre: SongState | null = null;
 let saveTimer = 0;
+let lastSavedAt = 0;
 
-const capture = (): SongState => ({ notes: studio.getNotes(), bpm: clock.bpm, infinite });
+const capture = (): SongState => ({
+  notes: studio.getNotes(),
+  bpm: clock.bpm,
+  infinite,
+  bars,
+  loop,
+});
+
 const record = (key?: string): void => {
   // 只要发生了新的可撤销操作，旧 toast 的"撤销"就不再指向那次操作了
   hud.hideToast();
@@ -46,15 +68,51 @@ const record = (key?: string): void => {
 
 function markDirty(): void {
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => saveLocal(capture()), 500);
+  saveTimer = window.setTimeout(() => {
+    saveLocal(capture());
+    lastSavedAt = Date.now();
+    updateSavedLabel();
+  }, 500);
 }
 
-/** 曲长：无限模式按内容整小节扩展，有限模式永远是 16 步 */
+function updateSavedLabel(): void {
+  if (!lastSavedAt) {
+    configPanel?.setSavedLabel('自动存档 · 本地');
+    return;
+  }
+  const seconds = Math.max(0, Math.round((Date.now() - lastSavedAt) / 1000));
+  const when = seconds < 5 ? '刚刚' : seconds < 60 ? `${seconds} 秒前` : `${Math.floor(seconds / 60)} 分钟前`;
+  configPanel?.setSavedLabel(`自动存档 · ${when}`);
+}
+
+/** 内容占用的整小节数 */
+function contentBars(): number {
+  return Math.max(1, Math.ceil((studio.maxStep + 1) / MEASURE));
+}
+
+/** 曲长：有限模式 = bars*16；无限模式取内容与 bars 的较大者，上限 32 小节 */
 function syncLength(): void {
-  const length = infinite ? songLength(studio.getNotes()) : MEASURE;
-  clock.setLength(length);
-  hud.setLength(length);
+  const content = contentBars();
+  if (infinite) bars = Math.min(MAX_BARS, Math.max(bars, content));
+  const length = (infinite ? Math.max(bars, content) : bars) * MEASURE;
+  clock.setLength(Math.min(MAX_BARS * MEASURE, length));
+  studio.setScrollable(clock.length > WINDOW);
+  hud.setLength(clock.length);
   hud.setEmpty(studio.blockCount === 0);
+  syncPanel();
+}
+
+function syncPanel(): void {
+  configPanel?.sync({
+    bars,
+    bpm: clock.bpm,
+    loop,
+    infinite,
+    notes: studio.blockCount,
+    windowCols: prefs.windowCols,
+    masterGain: audio.masterGain,
+    reverb: audio.reverbSend,
+  });
 }
 
 function sameNotes(a: Note[], b: Note[]): boolean {
@@ -65,18 +123,26 @@ function sameNotes(a: Note[], b: Note[]): boolean {
   return true;
 }
 
-function applyState(next: SongState, animate = false): void {
-  infinite = next.infinite;
+function applyState(next: SongStateInput, animate = false): void {
+  // 旧调用只给 notes/bpm/infinite：归一化补 bars/loop，不切掉任何音符
+  const state = normalizeState(next);
+  infinite = state.infinite;
+  bars = state.bars;
+  loop = state.loop;
   hud.setInfinite(infinite);
+  hud.setSettingsOpen(drawer?.isOpen ?? false);
   studio.setInfinite(infinite);
-  clock.setBpm(next.bpm);
+  clock.setLoop(loop);
+  clock.setBpm(state.bpm);
   hud.setBpm(clock.bpm);
-  studio.setSong(next.notes, animate);
+  studio.setSong(state.notes, animate);
   syncLength();
   clock.seek(Math.min(clock.position, clock.length - 1));
   viewOffset = 0;
-  if (infinite) studio.setWindow(Math.max(0, clock.position - WINDOW * 0.7), true);
+  if (studio.canScroll) studio.setWindow(Math.max(0, clock.position - WINDOW * 0.7), true);
   else studio.setWindow(0, true);
+  hud.setPlaying(false);
+  hud.setAtEnd(false);
   hud.setStep(clock.playing ? Math.floor(clock.position) % MEASURE : -1);
   hud.setProgress(clock.position, clock.length);
   hud.setEmpty(studio.blockCount === 0);
@@ -115,15 +181,86 @@ function toggleInfinite(): void {
   studio.setInfinite(infinite);
   syncLength();
   viewOffset = 0;
-  if (infinite) studio.setWindow(Math.max(0, clock.position - WINDOW * 0.7), true);
-  else {
-    studio.setWindow(0, true);
-    clock.seek(Math.min(clock.position, MEASURE - 1));
+  if (studio.canScroll) {
+    if (infinite) studio.setWindow(Math.max(0, clock.position - WINDOW * 0.7), true);
+    else studio.setWindow(0, true);
   }
+  clock.seek(Math.min(clock.position, clock.length - 1));
   hud.setStep(clock.playing ? Math.floor(clock.position) % MEASURE : -1);
   hud.setProgress(clock.position, clock.length);
   hud.dismissHint();
   markDirty();
+}
+
+/** 曲长改动：不得小于最后一个音符所在小节，低于时夹住并提示 */
+function setBars(target: number): void {
+  const min = contentBars();
+  const wanted = Math.max(1, Math.min(MAX_BARS, Math.round(target)));
+  const next = clampBars(Math.max(min, wanted));
+  if (next > wanted) hud.showToast(`第 ${min} 小节还有音符`, null, null, 2400);
+  if (next === bars) {
+    syncPanel();
+    return;
+  }
+  record();
+  bars = next;
+  syncLength();
+  if (clock.position > clock.length - 1) {
+    clock.seek(clock.length - 1);
+    hud.setProgress(clock.position, clock.length);
+  }
+  markDirty();
+}
+
+function setLoop(on: boolean): void {
+  if (on === loop) return;
+  record();
+  loop = on;
+  clock.setLoop(on);
+  if (!on) {
+    hud.setAtEnd(clock.atEnd);
+    if (clock.atEnd) hud.setPlaying(false);
+  }
+  hud.setProgress(clock.position, clock.length);
+  syncPanel();
+  markDirty();
+}
+
+/** BPM 滑杆：一次手势只压一条历史 */
+function setBpm(value: number, phase: GesturePhase): void {
+  if (phase === 'start') record('bpm');
+  const next = Math.max(60, Math.min(180, Math.round(value)));
+  if (next === clock.bpm) {
+    syncPanel();
+    return;
+  }
+  clock.setBpm(next);
+  hud.setBpm(clock.bpm);
+  syncPanel();
+  markDirty();
+}
+
+function setMasterGain(value: number): void {
+  prefs.masterGain = Math.min(1, Math.max(0, value));
+  audio.setMasterGain(prefs.masterGain);
+  savePrefs(prefs);
+  syncPanel();
+}
+
+function setReverb(value: number): void {
+  prefs.reverb = Math.min(1, Math.max(0, value));
+  audio.setReverbSend(prefs.reverb);
+  savePrefs(prefs);
+  syncPanel();
+}
+
+/** 窗口列数：M4 才真正重建舞台，这里先持久化并 feature-detect 调用 */
+function setWindowCols(value: number): void {
+  prefs.windowCols = clampWindowCols(value);
+  savePrefs(prefs);
+  const target = studio as unknown as { setWindowCols?: (cols: number) => void };
+  if (typeof target.setWindowCols === 'function') target.setWindowCols(prefs.windowCols);
+  syncPanel();
 }
 
 function clearAll(): void {
@@ -149,7 +286,7 @@ function seekTo(step: number): void {
   const target = Math.max(0, Math.min(MAX_STEPS - 1, Math.round(step)));
   clock.seek(target);
   viewOffset = 0;
-  if (infinite) studio.setWindow(Math.max(0, target - WINDOW * 0.7), true);
+  if (studio.canScroll) studio.setWindow(Math.max(0, target - WINDOW * 0.7), true);
   hud.setStep(clock.playing ? Math.floor(clock.position) % MEASURE : -1);
   hud.setProgress(clock.position, clock.length);
 }
@@ -201,8 +338,22 @@ function togglePlay(): void {
   void (async () => {
     await unlock();
     viewOffset = 0;
-    const playing = clock.toggle();
-    hud.setPlaying(playing);
+    if (clock.playing) {
+      clock.pause();
+      hud.setPlaying(false);
+      hud.setAtEnd(clock.atEnd);
+      return;
+    }
+    // 非循环播到末尾后，播放键 = 从头播
+    if (clock.atEnd) {
+      clock.rewind();
+      studio.setWindow(0, true);
+      hud.setProgress(0, clock.length);
+      hud.setStep(0);
+    }
+    clock.play();
+    hud.setPlaying(true);
+    hud.setAtEnd(false);
     hud.dismissHint();
   })();
 }
@@ -217,6 +368,7 @@ hud.onBpm = (delta) => {
   record('bpm');
   clock.setBpm(next);
   hud.setBpm(clock.bpm);
+  syncPanel();
   markDirty();
 };
 hud.onMuteRow = (row) => {
@@ -238,24 +390,62 @@ hud.onClear = clearAll;
 hud.onShare = () => void share();
 hud.onSeek = seekTo;
 studio.onViewChange = (id) => hud.setView(id);
+hud.onSettings = () => drawer.toggle();
+clock.onEnd = () => {
+  hud.setPlaying(false);
+  hud.setAtEnd(true);
+  hud.setStep(-1);
+  hud.setProgress(clock.length, clock.length);
+};
+
+// ---------------------------------------------------------------- 配置抽屉
+
+const configPanel = new ConfigPanel(document.querySelector<HTMLElement>('#settings-body')!, {
+  bars: (delta) => setBars(bars + delta),
+  bpm: setBpm,
+  loop: setLoop,
+  infinite: () => toggleInfinite(),
+  windowCols: setWindowCols,
+  masterGain: (value) => setMasterGain(value),
+  reverb: (value) => setReverb(value),
+  share: () => void share(),
+  clear: clearAll,
+});
+
+const drawer = new Drawer({
+  panel: document.querySelector<HTMLElement>('#settings-panel')!,
+  scrim: document.querySelector<HTMLElement>('#drawer-scrim'),
+  trigger: document.querySelector<HTMLElement>('#settings'),
+  closeButton: document.querySelector<HTMLElement>('#settings-close'),
+  onOpen: () => {
+    hud.setSettingsOpen(true);
+    syncPanel();
+    updateSavedLabel();
+  },
+  onClose: () => hud.setSettingsOpen(false),
+});
 
 // ---------------------------------------------------------------- boot
 
 const sharedCode = readShareCode();
 const sharedState = sharedCode ? decodeSong(sharedCode) : null;
 const savedState = sharedState ? null : loadLocal();
-const initial: SongState =
+const initial: SongState = normalizeState(
   sharedState ??
-  savedState ?? {
-    notes: DEMO.map(([step, row, midi]) => ({ step, row, midi })),
-    bpm: 108,
-    infinite: false,
-  };
+    savedState ?? {
+      notes: DEMO.map(([step, row, midi]) => ({ step, row, midi })),
+      bpm: 108,
+      infinite: false,
+    },
+);
 
 infinite = initial.infinite;
+bars = initial.bars;
+loop = initial.loop;
 hud.setInfinite(infinite);
 hud.setMuted(audio.muted);
 studio.setInfinite(infinite);
+clock.setLoop(loop);
 clock.setBpm(initial.bpm);
 hud.setBpm(clock.bpm);
 studio.setSong(initial.notes, true);
@@ -266,6 +456,9 @@ hud.setEmpty(studio.blockCount === 0);
 hud.setView(studio.view);
 hud.setStep(-1);
 hud.setProgress(0, clock.length);
+if (savedState) lastSavedAt = Date.now();
+setWindowCols(prefs.windowCols);
+updateSavedLabel();
 if (sharedState) {
   // 分享链接只负责"第一次打开"，之后编辑走本地存档，避免刷新又回到旧分享
   window.history.replaceState(null, '', window.location.pathname);
@@ -519,7 +712,7 @@ function disarmEdge(): void {
  */
 function armEdgeScroll(): void {
   const s = stroke;
-  if (!s || s.mode !== 'paint' || !infinite) {
+  if (!s || s.mode !== 'paint' || !studio.canScroll) {
     disarmEdge();
     return;
   }
@@ -534,8 +727,13 @@ function armEdgeScroll(): void {
     edgeTimer = 0;
     edgeArmed = false;
     const p = stroke;
-    if (!p || p.mode !== 'paint' || !infinite) return;
-    if (studio.windowTarget >= MAX_STEPS - WINDOW) return;
+    if (!p || p.mode !== 'paint' || !studio.canScroll) return;
+    // 有限长曲只在曲长内翻页；无限模式画到哪长到哪，上限仍是 32 小节
+    const limit = infinite ? MAX_STEPS : clock.length;
+    if (studio.windowTarget + WINDOW >= limit) {
+      disarmEdge();
+      return;
+    }
     studio.setWindow(studio.windowTarget + 1);
     const exact = studio.pointerToCellExactAt({ clientX: p.clientX, clientY: p.clientY }, studio.windowTarget);
     if (exact) advancePaint(exact, p.shift);
@@ -554,6 +752,7 @@ function pinchFromTouches(): { cx: number; cy: number; dist: number } | null {
 }
 
 canvas.addEventListener('pointerdown', (e) => {
+  if (drawer.isOpen) return;
   void unlock();
   if (e.pointerType === 'touch') {
     touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -639,7 +838,7 @@ function commitDrag(): { removed: boolean; drop: Cell | null } {
   audio.sfx(removed ? 'sfx_break' : 'sfx_place', 0, removed ? 0.95 : 0.85, removed ? 0.5 : 0.28);
   canvas.style.cursor = 'default';
   // 拖到窗口最右一列：松手后让出 4 列，像翻页
-  if (infinite && !removed && drop && drop.step >= studio.windowStart + WINDOW - 1) {
+  if (studio.canScroll && !removed && drop && drop.step >= studio.windowStart + WINDOW - 1) {
     studio.setWindow(studio.windowTarget + 4);
   }
   syncLength();
@@ -687,7 +886,7 @@ canvas.addEventListener(
       }
       return;
     }
-    if (infinite && (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY))) {
+    if (studio.canScroll && (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY))) {
       if (studio.isDragging) return;
       const delta = (e.shiftKey ? e.deltaY : e.deltaX) * 0.02;
       if (Math.abs(delta) < 0.01) return;
@@ -743,6 +942,16 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     togglePlay();
   }
+  if (e.key === ',' || e.key === '，') {
+    e.preventDefault();
+    drawer.toggle();
+    return;
+  }
+  if (e.key === 'Escape' && drawer.isOpen) {
+    e.preventDefault();
+    drawer.hide();
+    return;
+  }
   if (e.key === '1' || e.key === '2' || e.key === '3') {
     const id = e.key === '1' ? 'persp' : e.key === '2' ? 'top' : 'front';
     hud.onView?.(id);
@@ -788,7 +997,7 @@ function frame(now: number): void {
   hud.setMeasure(Math.floor(pos / MEASURE), Math.max(1, clock.length / MEASURE));
   hud.setProgress(pos, clock.length);
 
-  if (infinite && !studio.isDragging) {
+  if (studio.canScroll && !studio.isDragging) {
     if (prevPos - pos > 1) {
       // 循环回卷：窗口直接归位，不做倒带长滑
       viewOffset = 0;
@@ -806,7 +1015,14 @@ function frame(now: number): void {
 }
 
 // 调试/QA 钩子（放一次即可，别每帧赋值）
-Object.assign(window, { __studio: studio, __clock: clock, __audio: audio, __hud: hud });
+Object.assign(window, {
+  __studio: studio,
+  __clock: clock,
+  __audio: audio,
+  __hud: hud,
+  __config: configPanel,
+  __drawer: drawer,
+});
 Object.assign(window, {
   __nb: {
     capture,
@@ -818,8 +1034,22 @@ Object.assign(window, {
     share: () => shareUrl(capture()),
     clearAll,
     toggleInfinite,
+    setBars,
+    setLoop,
+    setWindowCols,
+    syncLength,
+    decode: decodeSong,
     get infinite() {
       return infinite;
+    },
+    get bars() {
+      return bars;
+    },
+    get loop() {
+      return loop;
+    },
+    get prefs() {
+      return { ...prefs };
     },
   },
 });

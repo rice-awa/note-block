@@ -104,6 +104,31 @@
               />
             </svg>
           </button>
+          <button
+            id="settings"
+            class="icon-btn icon-btn--sm"
+            type="button"
+            aria-label="设置"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+            title="设置 (,)"
+          >
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M12 8.6a3.4 3.4 0 1 0 0 6.8 3.4 3.4 0 0 0 0-6.8Z"
+                stroke="currentColor"
+                stroke-width="1.6"
+                fill="none"
+              />
+              <path
+                d="M19.4 13.6a7.6 7.6 0 0 0 0-3.2l1.7-1.3-1.9-3.3-2 .8a7.7 7.7 0 0 0-2.8-1.6L14 2.9h-4l-.4 2.1a7.7 7.7 0 0 0-2.8 1.6l-2-.8L2.9 9.1l1.7 1.3a7.6 7.6 0 0 0 0 3.2l-1.7 1.3 1.9 3.3 2-.8a7.7 7.7 0 0 0 2.8 1.6l.4 2.1h4l.4-2.1a7.7 7.7 0 0 0 2.8-1.6l2 .8 1.9-3.3-1.7-1.3Z"
+                stroke="currentColor"
+                stroke-width="1.5"
+                fill="none"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
           <button id="sound" class="icon-btn" type="button" aria-label="静音">
             <svg class="ico ico-on" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M4 9.4h3.1L11.6 6v12L7.1 14.6H4z" fill="currentColor" />
@@ -176,6 +201,27 @@
         <div class="rail-thumb" id="railThumb"></div>
       </div>
     </footer>
+
+    <div id="drawer-scrim" class="drawer-scrim" aria-hidden="true" hidden></div>
+    <aside
+      id="settings-panel"
+      class="drawer"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      aria-hidden="true"
+      hidden
+    >
+      <div class="drawer-head">
+        <h2 id="settings-title" class="drawer-title">设置</h2>
+        <button id="settings-close" class="drawer-close" type="button" aria-label="关闭设置">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M7 7l10 10M17 7 7 17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+        </button>
+      </div>
+      <div id="settings-body" class="drawer-body"></div>
+    </aside>
 
     <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden>
       <span id="toast-text" class="toast-text"></span>

@@ -788,6 +788,364 @@ body.is-playing .play .ico-pause {
   white-space: nowrap;
 }
 
+/* ---------------------------------------------------------------- 设置抽屉 */
+
+.drawer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 8;
+  background: rgba(32, 30, 26, 0.18);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 220ms ease;
+}
+
+.drawer-scrim[hidden] {
+  display: none;
+}
+
+.drawer-scrim.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 桌面不加全屏遮罩，点面板外直接关闭 */
+@media (min-width: 901px) {
+  .drawer-scrim {
+    display: none !important;
+  }
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 9;
+  display: flex;
+  flex-direction: column;
+  width: 320px;
+  max-width: calc(100vw - 24px);
+  padding: 22px 22px 24px;
+  border-left: 1px solid var(--glass-border);
+  background: rgba(255, 253, 248, 0.82);
+  box-shadow: -16px 0 48px rgba(74, 57, 28, 0.12);
+  backdrop-filter: blur(28px) saturate(160%);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  transform: translateX(102%);
+  transition: transform 260ms cubic-bezier(0.23, 1, 0.32, 1);
+  overflow: hidden;
+}
+
+.drawer[hidden] {
+  display: none;
+}
+
+.drawer.is-open {
+  transform: translateX(0);
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.drawer-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+}
+
+.drawer-close {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+}
+
+.drawer-close svg {
+  width: 16px;
+  height: 16px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .drawer-close:hover {
+    background: rgba(32, 30, 26, 0.06);
+    color: var(--ink);
+  }
+}
+
+.drawer-body {
+  flex: 1;
+  min-height: 0;
+  margin-top: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+/* ---------------------------------------------------------------- 配置面板 */
+
+.cfg-section {
+  padding: 13px 0 15px;
+  border-bottom: 1px solid var(--line);
+}
+
+.cfg-section:last-child {
+  border-bottom: 0;
+}
+
+.cfg-heading {
+  margin: 0 0 9px;
+  color: var(--muted);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.cfg-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+}
+
+.cfg-row--split {
+  justify-content: space-between;
+}
+
+.cfg-row--slider .cfg-label {
+  flex: 0 0 56px;
+}
+
+.cfg-label {
+  font-size: 12.5px;
+  font-weight: 520;
+  letter-spacing: 0.02em;
+}
+
+.cfg-stepper {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.cfg-step {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    transform 120ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.cfg-step:active {
+  transform: scale(0.9);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .cfg-step:hover {
+    background: rgba(32, 30, 26, 0.06);
+    color: var(--ink);
+  }
+}
+
+.cfg-value {
+  min-width: 60px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.cfg-value--mono,
+.cfg-num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.cfg-num {
+  flex: none;
+  min-width: 40px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.cfg-readout {
+  margin: 1px 0 9px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.cfg-hint {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  line-height: 1.45;
+}
+
+.cfg-range {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+.cfg-range::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(32, 30, 26, 0.14);
+}
+
+.cfg-range::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  margin-top: -5.5px;
+  border: 1.5px solid var(--accent);
+  border-radius: 50%;
+  background: #fffdf7;
+  box-shadow: 0 1px 3px rgba(74, 57, 28, 0.24);
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.cfg-range::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(32, 30, 26, 0.14);
+}
+
+.cfg-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid var(--accent);
+  border-radius: 50%;
+  background: #fffdf7;
+  box-shadow: 0 1px 3px rgba(74, 57, 28, 0.24);
+}
+
+.cfg-switch {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 11px 3px 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.45);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 560;
+  cursor: pointer;
+  transition:
+    background 180ms ease,
+    color 180ms ease,
+    border-color 180ms ease;
+}
+
+.cfg-switch-dot {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(32, 30, 26, 0.18);
+  transition: background 180ms ease;
+}
+
+.cfg-switch-text {
+  min-width: 1em;
+  font-variant-numeric: tabular-nums;
+}
+
+.cfg-switch.is-on {
+  border-color: transparent;
+  background: var(--ink);
+  color: #fffdf7;
+}
+
+.cfg-switch.is-on .cfg-switch-dot {
+  background: #fffdf7;
+}
+
+.cfg-note {
+  margin: 2px 0 10px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.cfg-btn {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.5);
+  font-size: 12px;
+  font-weight: 520;
+  letter-spacing: 0.02em;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    background 160ms ease,
+    transform 120ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.cfg-btn:active {
+  transform: scale(0.99);
+}
+
+.cfg-btn--danger {
+  color: var(--accent);
+}
+
+.cfg-btn--danger:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .cfg-btn:not(:disabled):hover {
+    background: rgba(255, 255, 255, 0.86);
+  }
+}
+
 /* ---------------------------------------------------------------- 窄屏 */
 
 @media (max-width: 900px) {
@@ -889,5 +1247,11 @@ body.is-playing .play .ico-pause {
   * {
     transition-duration: 1ms !important;
     animation-duration: 1ms !important;
+  }
+
+  /* 抽屉直接出现，不做滑入 */
+  .drawer,
+  .drawer-scrim {
+    transition: none;
   }
 }

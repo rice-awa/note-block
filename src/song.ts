@@ -13,16 +13,32 @@ export interface SongState {
   notes: Note[];
   bpm: number;
   infinite: boolean;
+  /** 曲长（小节，1..32），每小节 16 步 */
+  bars: number;
+  /** 播完循环 / 停在末尾 */
+  loop: boolean;
 }
 
-export const MAX_STEPS: number = 1024;
+/** 外部（旧调用、存档、分享）可能只给一部分字段，归一化时补默认值 */
+export interface SongStateInput {
+  notes: Note[];
+  bpm: number;
+  infinite: boolean;
+  bars?: number;
+  loop?: boolean;
+}
+
+export const MAX_STEPS: number = 512;
 export const MEASURE: number = 16;
+export const MAX_BARS: number = 32;
+export const MIN_BARS: number = 1;
 export const ROWS_COUNT: number = 8;
 export const MIDI_MIN: number = 0;
 export const MIDI_MAX: number = 24;
 export const STORAGE_KEY: string = 'note-block:v1';
 
-const VERSION = 1;
+const VERSION = 2;
+const VERSION_V1 = 1;
 const BPM_MIN = 60;
 const BPM_MAX = 180;
 const DEFAULT_BPM = 120;
@@ -36,10 +52,17 @@ const clampBpm = (bpm: number): number => {
   return Math.min(BPM_MAX, Math.max(BPM_MIN, Math.round(bpm)));
 };
 
+export const clampBars = (bars: number): number => {
+  if (!Number.isFinite(bars)) return MIN_BARS;
+  return Math.min(MAX_BARS, Math.max(MIN_BARS, Math.round(bars)));
+};
+
 const copyState = (state: SongState): SongState => ({
   notes: state.notes.map((n) => ({ step: n.step, row: n.row, midi: n.midi })),
   bpm: state.bpm,
   infinite: state.infinite,
+  bars: state.bars,
+  loop: state.loop,
 });
 
 /** 校验单条音符：整数且在界内，返回新对象 */
@@ -62,6 +85,46 @@ export function songLength(notes: Note[]): number {
   if (maxStep < 0) return MEASURE;
   const rounded = Math.ceil((maxStep + 1) / MEASURE) * MEASURE;
   return Math.min(MAX_STEPS, Math.max(MEASURE, rounded));
+}
+
+/** 曲长（小节）：至少 1 小节，按 16 步向上取整，上限 MAX_BARS */
+export function songBars(notes: Note[]): number {
+  return clampBars(songLength(notes) / MEASURE);
+}
+
+/** 有限模式 / 内容长度（步） */
+export function songSteps(bars: number): number {
+  return clampBars(bars) * MEASURE;
+}
+
+/** 时长读数（秒）：bars * 16 步 * 每步时长 */
+export function songDuration(bars: number, bpm: number): number {
+  return (clampBars(bars) * MEASURE * 60) / (clampBpm(bpm) * 4);
+}
+
+/** 秒 → `0:08.9` */
+export function formatDuration(seconds: number): string {
+  const total = Math.max(0, Number.isFinite(seconds) ? seconds : 0);
+  const minutes = Math.floor(total / 60);
+  const rest = total - minutes * 60;
+  return `${minutes}:${rest.toFixed(1).padStart(4, '0')}`;
+}
+
+/**
+ * 归一化：旧调用只给 notes/bpm/infinite 时，bars 取内容整小节，loop 默认开启。
+ * 曲长下限始终不切掉已有音符。
+ */
+export function normalizeState(input: SongStateInput): SongState {
+  const notes = normalizeNotes(input.notes ?? []);
+  const content = Math.max(1, Math.ceil(songLength(notes) / MEASURE));
+  const bars = clampBars(Math.max(content, typeof input.bars === 'number' ? input.bars : content));
+  return {
+    notes,
+    bpm: clampBpm(input.bpm),
+    infinite: input.infinite === true,
+    bars,
+    loop: input.loop !== false,
+  };
 }
 
 /** 清洗并去重（同 step+row 保留最后一条，顺序按各自最后一次出现） */
@@ -120,7 +183,8 @@ function fromBase64Url(code: string): Uint8Array | null {
 }
 
 /**
- * 编码：header 5 字节 [version, bpm, flags, countLo, countHi] + 每条 3 字节。
+ * 编码 v2：header 6 字节 [version, bpm, flags, bars, countLo, countHi] + 每条 3 字节。
+ * flags bit0 = infinite，bit1 = loop。
  * b0 = step & 0xff
  * b1 = (step>>8)&0x03 | (row&0x07)<<2 | (midi&0x03)<<5
  * b2 = (midi>>2)&0x3f
@@ -128,13 +192,17 @@ function fromBase64Url(code: string): Uint8Array | null {
  */
 export function encodeSong(state: SongState): string {
   const notes = normalizeNotes(state.notes);
-  const bytes = new Uint8Array(5 + notes.length * 3);
+  const content = Math.max(1, Math.ceil(songLength(notes) / MEASURE));
+  const bars = clampBars(Math.max(content, state.bars));
+  const flags = (state.infinite ? 1 : 0) | (state.loop === false ? 0 : 2);
+  const bytes = new Uint8Array(6 + notes.length * 3);
   bytes[0] = VERSION;
   bytes[1] = clampBpm(state.bpm);
-  bytes[2] = state.infinite ? 1 : 0;
-  bytes[3] = notes.length & 0xff;
-  bytes[4] = (notes.length >> 8) & 0xff;
-  let i = 5;
+  bytes[2] = flags;
+  bytes[3] = bars;
+  bytes[4] = notes.length & 0xff;
+  bytes[5] = (notes.length >> 8) & 0xff;
+  let i = 6;
   for (const note of notes) {
     bytes[i++] = note.step & 0xff;
     bytes[i++] = ((note.step >> 8) & 0x03) | ((note.row & 0x07) << 2) | ((note.midi & 0x03) << 5);
@@ -143,22 +211,30 @@ export function encodeSong(state: SongState): string {
   return toBase64Url(bytes);
 }
 
-/** 解码：version / 长度 / bpm / flags / 越界任一不合法都返回 null，不抛错 */
+/** 解码：v2 读 bars/loop；v1（5 字节 header）按内容整小节补 bars、loop 默认开 */
 export function decodeSong(code: string): SongState | null {
   try {
     if (typeof code !== 'string' || code.length === 0) return null;
     const bytes = fromBase64Url(code.replace(/=+$/, ''));
     if (!bytes || bytes.length < 5) return null;
-    if (bytes[0] !== VERSION) return null;
+    const version = bytes[0];
+    if (version !== VERSION && version !== VERSION_V1) return null;
+    const header = version === VERSION_V1 ? 5 : 6;
+    if (bytes.length < header) return null;
     const bpm = bytes[1];
     if (bpm < BPM_MIN || bpm > BPM_MAX) return null;
     const flags = bytes[2];
-    if ((flags & ~1) !== 0) return null;
-    const count = bytes[3] | (bytes[4] << 8);
+    const maxFlags = version === VERSION_V1 ? 1 : 3;
+    if ((flags & ~maxFlags) !== 0) return null;
+    const bars = version === VERSION_V1 ? 0 : bytes[3];
+    if (version === VERSION && (bars < MIN_BARS || bars > MAX_BARS)) return null;
+    const countLo = bytes[version === VERSION_V1 ? 3 : 4];
+    const countHi = bytes[version === VERSION_V1 ? 4 : 5];
+    const count = countLo | (countHi << 8);
     if (count > MAX_STEPS * ROWS_COUNT) return null;
-    if (bytes.length !== 5 + count * 3) return null;
+    if (bytes.length !== header + count * 3) return null;
     const notes: Note[] = [];
-    let i = 5;
+    let i = header;
     for (let k = 0; k < count; k++) {
       const b0 = bytes[i++];
       const b1 = bytes[i++];
@@ -171,7 +247,14 @@ export function decodeSong(code: string): SongState | null {
       if (!note) return null;
       notes.push(note);
     }
-    return { notes, bpm, infinite: (flags & 1) === 1 };
+    const content = Math.max(1, Math.ceil(songLength(notes) / MEASURE));
+    return {
+      notes,
+      bpm,
+      infinite: (flags & 1) === 1,
+      bars: clampBars(Math.max(content, version === VERSION_V1 ? content : bars)),
+      loop: version === VERSION_V1 ? true : (flags & 2) === 2,
+    };
   } catch {
     return null;
   }
@@ -199,7 +282,7 @@ function getStorage(): Storage | null {
   }
 }
 
-/** 读取本地存档：校验结构并 sanitize/去重，异常返回 null */
+/** 读取本地存档：v2 校验全字段；v1 自动迁移成 v2（bars 按内容、loop 开） */
 export function loadLocal(): SongState | null {
   try {
     const store = getStorage();
@@ -209,25 +292,37 @@ export function loadLocal(): SongState | null {
     const data: unknown = JSON.parse(raw);
     if (!data || typeof data !== 'object') return null;
     const obj = data as Record<string, unknown>;
-    if (obj.v !== VERSION || !Array.isArray(obj.notes)) return null;
+    if (!Array.isArray(obj.notes)) return null;
+    if (obj.v !== VERSION && obj.v !== VERSION_V1) return null;
     const notes = normalizeNotes(obj.notes as Note[]);
-    const bpm = typeof obj.bpm === 'number' ? clampBpm(obj.bpm) : DEFAULT_BPM;
-    return { notes, bpm, infinite: obj.infinite === true };
+    const content = Math.max(1, Math.ceil(songLength(notes) / MEASURE));
+    const bars = obj.v === VERSION && typeof obj.bars === 'number' ? clampBars(obj.bars) : content;
+    return normalizeState({
+      notes,
+      bpm: typeof obj.bpm === 'number' ? obj.bpm : DEFAULT_BPM,
+      infinite: obj.infinite === true,
+      bars,
+      loop: obj.v === VERSION ? obj.loop !== false : true,
+    });
   } catch {
     return null;
   }
 }
 
-/** 写入本地存档；隐私模式、配额满等失败一律静默 */
+/** 写入本地存档（v2）；隐私模式、配额满等失败一律静默 */
 export function saveLocal(state: SongState): void {
   try {
     const store = getStorage();
     if (!store) return;
+    const notes = normalizeNotes(state.notes);
+    const content = Math.max(1, Math.ceil(songLength(notes) / MEASURE));
     const payload = {
       v: VERSION,
-      notes: normalizeNotes(state.notes),
+      notes,
       bpm: clampBpm(state.bpm),
       infinite: state.infinite === true,
+      bars: clampBars(Math.max(content, state.bars)),
+      loop: state.loop !== false,
     };
     store.setItem(STORAGE_KEY, JSON.stringify(payload));
   } catch {

@@ -45,6 +45,17 @@ export class AudioEngine {
   private dry: GainNode | null = null;
   private send: GainNode | null = null;
   private initPromise: Promise<void> | null = null;
+  /** 主音量与混响送出量：属于本机偏好，AudioContext 建好前就记住 */
+  private volume = 0.82;
+  private reverb = 0.16;
+
+  get masterGain(): number {
+    return this.volume;
+  }
+
+  get reverbSend(): number {
+    return this.reverb;
+  }
 
   get now(): number {
     return this.ctx ? this.ctx.currentTime : 0;
@@ -75,7 +86,7 @@ export class AudioEngine {
     if (!ctx) throw new Error('no context');
 
     const master = ctx.createGain();
-    master.gain.value = 0.82;
+    master.gain.value = this.volume;
 
     const comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -20;
@@ -88,7 +99,7 @@ export class AudioEngine {
     dry.gain.value = 1;
 
     const send = ctx.createGain();
-    send.gain.value = 0.16;
+    send.gain.value = this.reverb;
 
     const conv = ctx.createConvolver();
     conv.buffer = this.makeIR(ctx, 1.9);
@@ -139,10 +150,26 @@ export class AudioEngine {
 
   setMuted(muted: boolean): void {
     this.muted = muted;
-    if (this.master && this.ctx) {
-      this.master.gain.cancelScheduledValues(this.ctx.currentTime);
-      this.master.gain.setTargetAtTime(muted ? 0 : 0.82, this.ctx.currentTime, 0.03);
-    }
+    this.scheduleGain(this.master, muted ? 0 : this.volume, 0.03);
+  }
+
+  /** 主音量 0..1：setTargetAtTime 平滑，避免拖动滑杆时爆音 */
+  setMasterGain(value: number): void {
+    this.volume = Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0.82));
+    this.scheduleGain(this.master, this.muted ? 0 : this.volume, 0.03);
+  }
+
+  /** 混响送出量 0..1 */
+  setReverbSend(value: number): void {
+    this.reverb = Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0.16));
+    this.scheduleGain(this.send, this.reverb, 0.05);
+  }
+
+  private scheduleGain(node: GainNode | null, value: number, tau: number): void {
+    if (!node || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    node.gain.cancelScheduledValues(now);
+    node.gain.setTargetAtTime(value, now, tau);
   }
 
   /** when 是相对当前时间的秒数；midi 0..24，12 = 原速 */
@@ -297,10 +324,14 @@ export interface ScheduledStep {
  */
 export class Clock {
   bpm = 108;
-  /** 循环长度（步数），16..1024 */
+  /** 循环长度（步数），16..512（1..32 小节） */
   length = 16;
+  /** 播完循环 / 停在末尾 */
+  loop = true;
   playing = false;
   scheduled: ScheduledStep[] = [];
+  /** 非循环播到末尾时通知 UI */
+  onEnd: (() => void) | null = null;
 
   private anchor = 0;
   private basePos = 0;
@@ -318,18 +349,25 @@ export class Clock {
 
   get position(): number {
     if (!this.audio.ctx) return 0;
-    if (!this.playing) return this.basePos;
-    const p = this.basePos + (this.audio.now - this.anchor) / this.stepDur;
-    return ((p % this.length) + this.length) % this.length;
+    const raw = this.playing ? this.basePos + (this.audio.now - this.anchor) / this.stepDur : this.basePos;
+    if (this.loop) return ((raw % this.length) + this.length) % this.length;
+    return Math.max(0, Math.min(this.length, raw));
+  }
+
+  /** 暂停且停在新长度末尾：播放键应变成「从头播」 */
+  get atEnd(): boolean {
+    return !this.playing && !this.loop && this.basePos >= this.length - 1e-6;
   }
 
   play(): void {
     if (this.playing || !this.audio.ctx) return;
+    // 停在末尾时再播：先回卷，避免从 length 起算把首步吞掉
+    if (!this.loop && this.basePos >= this.length) this.basePos = 0;
     this.playing = true;
     const now = this.audio.now;
     this.anchor = now + 0.06;
-    this.nextStep = Math.ceil(this.basePos) % this.length;
-    const offset = Math.ceil(this.basePos) - this.basePos;
+    this.nextStep = Math.ceil(this.basePos);
+    const offset = this.nextStep - this.basePos;
     this.nextTime = this.anchor + offset * this.stepDur;
     this.scheduled.length = 0;
   }
@@ -353,8 +391,8 @@ export class Clock {
     if (this.playing) {
       this.basePos = this.position;
       this.anchor = this.audio.now;
-      this.nextStep = Math.ceil(this.basePos) % this.length;
-      const offset = Math.ceil(this.basePos) - this.basePos;
+      this.nextStep = Math.ceil(this.basePos);
+      const offset = this.nextStep - this.basePos;
       this.bpm = clamped;
       this.nextTime = this.anchor + offset * this.stepDur;
       this.scheduled.length = 0;
@@ -363,24 +401,43 @@ export class Clock {
     }
   }
 
-  /** 改循环长度：clamp 到 16..1024 的整数；播放中重锚，越界的 basePos 夹回新长度内 */
+  /** 改循环长度：clamp 到 16..512 的整数；播放中重锚，越界的 basePos 夹回新长度内 */
   setLength(length: number): void {
-    const clamped = Math.max(16, Math.min(1024, Math.round(length)));
+    const clamped = Math.max(16, Math.min(512, Math.round(length)));
     if (clamped === this.length) return;
     if (this.playing) {
       // 先用旧长度取位置，再换 length（同 setBpm 的顺序）
       this.basePos = this.position;
       this.anchor = this.audio.now;
       this.length = clamped;
-      if (this.basePos >= this.length) this.basePos = 0;
-      this.nextStep = Math.ceil(this.basePos) % this.length;
-      const offset = Math.ceil(this.basePos) - this.basePos;
+      if (this.loop) {
+        this.basePos = ((this.basePos % this.length) + this.length) % this.length;
+      } else if (this.basePos > this.length) {
+        this.basePos = this.length;
+      }
+      this.nextStep = Math.ceil(this.basePos);
+      const offset = this.nextStep - this.basePos;
       this.nextTime = this.anchor + offset * this.stepDur;
       this.scheduled.length = 0;
     } else {
       this.length = clamped;
-      if (this.basePos >= this.length) this.basePos = this.length - 1;
-      if (this.basePos < 0) this.basePos = 0;
+      if (this.loop) this.basePos = ((this.basePos % this.length) + this.length) % this.length;
+      else this.basePos = Math.min(this.basePos, this.length);
+    }
+  }
+
+  /** 切换循环：关闭时若已越过新语义的末尾，停在末尾 */
+  setLoop(loop: boolean): void {
+    if (loop === this.loop) return;
+    const pos = this.position;
+    this.loop = loop;
+    this.basePos = loop ? ((pos % this.length) + this.length) % this.length : Math.min(this.length, pos);
+    if (this.playing) {
+      this.anchor = this.audio.now;
+      this.nextStep = Math.ceil(this.basePos);
+      const offset = this.nextStep - this.basePos;
+      this.nextTime = this.anchor + offset * this.stepDur;
+      this.scheduled.length = 0;
     }
   }
 
@@ -390,8 +447,8 @@ export class Clock {
     this.scheduled.length = 0;
     if (!this.playing) return;
     this.anchor = this.audio.now + 0.06;
-    this.nextStep = Math.ceil(this.basePos) % this.length;
-    const offset = Math.ceil(this.basePos) - this.basePos;
+    this.nextStep = Math.ceil(this.basePos);
+    const offset = this.nextStep - this.basePos;
     this.nextTime = this.anchor + offset * this.stepDur;
   }
 
@@ -399,16 +456,27 @@ export class Clock {
     this.seek(0);
   }
 
-  /** 每帧调用：向前调度 + 到点交出视觉事件 */
+  /** 每帧调用：向前调度 + 到点交出视觉事件；非循环播到末尾时停住 */
   update(): void {
     const ctx = this.audio.ctx;
     if (!ctx || !this.playing) return;
     const now = ctx.currentTime;
     while (this.nextTime < now + 0.12) {
-      this.onSchedule(this.nextStep, this.nextTime);
-      this.scheduled.push({ time: this.nextTime, step: this.nextStep });
+      if (!this.loop && this.nextStep >= this.length) break;
+      const step = ((this.nextStep % this.length) + this.length) % this.length;
+      this.onSchedule(step, this.nextTime);
+      this.scheduled.push({ time: this.nextTime, step });
       this.nextTime += this.stepDur;
-      this.nextStep = (this.nextStep + 1) % this.length;
+      this.nextStep += 1;
+    }
+    if (!this.loop) {
+      const endAt = this.anchor + (this.length - this.basePos) * this.stepDur;
+      if (now >= endAt) {
+        this.basePos = this.length;
+        this.playing = false;
+        this.scheduled.length = 0;
+        this.onEnd?.();
+      }
     }
   }
 

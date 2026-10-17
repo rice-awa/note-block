@@ -105,6 +105,8 @@ export class Studio {
   private viewStart = 0;
   private viewStartTarget = 0;
   private infinite = false;
+  /** 曲长超过一屏：有限长曲与无限模式都要能横向滑动窗口 */
+  private scrollable = false;
   private playheadPos = 0;
   private playheadShown = false;
   private readonly textures = new Map<string, THREE.Texture>();
@@ -648,11 +650,21 @@ export class Studio {
 
   setInfinite(on: boolean): void {
     this.infinite = on;
-    if (!on) this.setWindow(0, true);
   }
 
   get isInfinite(): boolean {
     return this.infinite;
+  }
+
+  /** 曲长超过一屏才允许窗口滚动；关掉时立即回到第一屏 */
+  setScrollable(on: boolean): void {
+    if (on === this.scrollable) return;
+    this.scrollable = on;
+    if (!on) this.setWindow(0, true);
+  }
+
+  get canScroll(): boolean {
+    return this.scrollable;
   }
 
   get windowStart(): number {
@@ -667,7 +679,7 @@ export class Studio {
   setWindow(target: number, snap = false): void {
     const maxStart = Math.max(0, MAX_STEPS - WINDOW);
     this.viewStartTarget = clamp(target, 0, maxStart);
-    if (!this.infinite) {
+    if (!this.scrollable) {
       this.viewStart = 0;
       this.viewStartTarget = 0;
     } else if (snap) {
@@ -1157,8 +1169,8 @@ export class Studio {
     );
     this.camera.lookAt(this.lookAt);
 
-    // 无限模式：窗口左缘用阻尼追目标；切回有限模式立即归零
-    if (this.infinite) {
+    // 可滚动时窗口左缘用阻尼追目标；一屏装得下就立即归零
+    if (this.scrollable) {
       this.viewStart = damp(this.viewStart, this.viewStartTarget, 7, dt);
       if (Math.abs(this.viewStart - this.viewStartTarget) < 0.0005) this.viewStart = this.viewStartTarget;
     } else if (this.viewStart !== 0) {
