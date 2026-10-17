@@ -5,6 +5,33 @@ type Voice = { gain: number; sample: string };
 const SFX = ['sfx_place', 'sfx_break', 'sfx_click'] as const;
 
 /**
+ * 合成 UI 音效用的白噪声：按 AudioContext 懒创建一次（mono 1 秒）并缓存，
+ * 不新增实例字段，多个音效共用同一份 buffer。
+ */
+const NOISE_CACHE = new WeakMap<AudioContext, AudioBuffer>();
+
+function noiseBuffer(ctx: AudioContext): AudioBuffer {
+  let buf = NOISE_CACHE.get(ctx);
+  if (!buf) {
+    const len = Math.max(1, Math.floor(ctx.sampleRate));
+    buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+    NOISE_CACHE.set(ctx, buf);
+  }
+  return buf;
+}
+
+/** 声源结束后自动断开自身与串接的临时节点，避免连接残留 / onended 泄漏 */
+function disposeAfter(src: AudioScheduledSourceNode, nodes: AudioNode[]): void {
+  src.onended = () => {
+    src.onended = null;
+    src.disconnect();
+    for (const n of nodes) n.disconnect();
+  };
+}
+
+/**
  * 全合成信号链之外的"原声"部分：音符盒采样 + 卷积混响 + 压缩。
  * AudioContext 只在第一次手势后创建/恢复（浏览器自动播放策略）。
  */
@@ -154,6 +181,109 @@ export class AudioEngine {
     if (this.send) g.connect(this.send);
     src.start(ctx.currentTime + Math.max(0, when));
   }
+
+  /** 一键清屏：白噪带通 600 → 5200Hz 扫，声像 -0.7 → +0.7 扫开 */
+  wipe(duration = 0.36, gain = 0.42): void {
+    const ctx = this.ctx;
+    // 采样没加载完也要能响，所以只卡 ctx / muted，不要求 ready
+    if (!ctx || this.muted) return;
+    const now = ctx.currentTime;
+    const dur = Math.max(0.08, duration);
+    const peak = Math.max(0.0001, gain);
+
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuffer(ctx);
+    src.loop = true;
+
+    const band = ctx.createBiquadFilter();
+    band.type = 'bandpass';
+    band.Q.value = 1.1;
+    band.frequency.setValueAtTime(600, now);
+    band.frequency.exponentialRampToValueAtTime(5200, now + dur);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    // 约 35ms 起音，之后指数衰减到静音底
+    g.gain.exponentialRampToValueAtTime(peak, now + 0.035);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur + 0.05);
+
+    const pan = ctx.createStereoPanner();
+    pan.pan.setValueAtTime(-0.7, now);
+    pan.pan.linearRampToValueAtTime(0.7, now + dur);
+
+    src.connect(band);
+    band.connect(g);
+    g.connect(pan);
+    if (this.dry) pan.connect(this.dry);
+    if (this.send) pan.connect(this.send);
+
+    src.start(now);
+    src.stop(now + dur + 0.06);
+    disposeAfter(src, [band, g, pan]);
+  }
+
+  /** 撤销 / 落块的低频砸击感：140 → 44Hz 正弦扫过 200Hz 低通 */
+  thump(gain = 0.5): void {
+    const ctx = this.ctx;
+    if (!ctx || this.muted) return;
+    const now = ctx.currentTime;
+    const peak = Math.max(0.0001, gain);
+
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(140, now);
+    osc.frequency.exponentialRampToValueAtTime(44, now + 0.24);
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 200;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(peak, now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
+
+    osc.connect(lp);
+    lp.connect(g);
+    if (this.dry) g.connect(this.dry);
+    if (this.send) g.connect(this.send);
+
+    osc.start(now);
+    osc.stop(now + 0.3);
+    disposeAfter(osc, [lp, g]);
+  }
+
+  /** 撤销回滚：白噪带通反向扫（3500 → 700Hz），轻起轻落 */
+  restoreSweep(duration = 0.3, gain = 0.22): void {
+    const ctx = this.ctx;
+    if (!ctx || this.muted) return;
+    const now = ctx.currentTime;
+    const dur = Math.max(0.08, duration);
+    const peak = Math.max(0.0001, gain);
+
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuffer(ctx);
+    src.loop = true;
+
+    const band = ctx.createBiquadFilter();
+    band.type = 'bandpass';
+    band.Q.value = 1.1;
+    band.frequency.setValueAtTime(3500, now);
+    band.frequency.exponentialRampToValueAtTime(700, now + dur);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(peak, now + dur * 0.5);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    src.connect(band);
+    band.connect(g);
+    if (this.dry) g.connect(this.dry);
+    if (this.send) g.connect(this.send);
+
+    src.start(now);
+    src.stop(now + dur + 0.06);
+    disposeAfter(src, [band, g]);
+  }
 }
 
 export interface ScheduledStep {
@@ -167,6 +297,8 @@ export interface ScheduledStep {
  */
 export class Clock {
   bpm = 108;
+  /** 循环长度（步数），16..1024 */
+  length = 16;
   playing = false;
   scheduled: ScheduledStep[] = [];
 
@@ -188,7 +320,7 @@ export class Clock {
     if (!this.audio.ctx) return 0;
     if (!this.playing) return this.basePos;
     const p = this.basePos + (this.audio.now - this.anchor) / this.stepDur;
-    return ((p % 16) + 16) % 16;
+    return ((p % this.length) + this.length) % this.length;
   }
 
   play(): void {
@@ -196,7 +328,7 @@ export class Clock {
     this.playing = true;
     const now = this.audio.now;
     this.anchor = now + 0.06;
-    this.nextStep = Math.ceil(this.basePos) % 16;
+    this.nextStep = Math.ceil(this.basePos) % this.length;
     const offset = Math.ceil(this.basePos) - this.basePos;
     this.nextTime = this.anchor + offset * this.stepDur;
     this.scheduled.length = 0;
@@ -221,7 +353,7 @@ export class Clock {
     if (this.playing) {
       this.basePos = this.position;
       this.anchor = this.audio.now;
-      this.nextStep = Math.ceil(this.basePos) % 16;
+      this.nextStep = Math.ceil(this.basePos) % this.length;
       const offset = Math.ceil(this.basePos) - this.basePos;
       this.bpm = clamped;
       this.nextTime = this.anchor + offset * this.stepDur;
@@ -229,6 +361,42 @@ export class Clock {
     } else {
       this.bpm = clamped;
     }
+  }
+
+  /** 改循环长度：clamp 到 16..1024 的整数；播放中重锚，越界的 basePos 夹回新长度内 */
+  setLength(length: number): void {
+    const clamped = Math.max(16, Math.min(1024, Math.round(length)));
+    if (clamped === this.length) return;
+    if (this.playing) {
+      // 先用旧长度取位置，再换 length（同 setBpm 的顺序）
+      this.basePos = this.position;
+      this.anchor = this.audio.now;
+      this.length = clamped;
+      if (this.basePos >= this.length) this.basePos = 0;
+      this.nextStep = Math.ceil(this.basePos) % this.length;
+      const offset = Math.ceil(this.basePos) - this.basePos;
+      this.nextTime = this.anchor + offset * this.stepDur;
+      this.scheduled.length = 0;
+    } else {
+      this.length = clamped;
+      if (this.basePos >= this.length) this.basePos = this.length - 1;
+      if (this.basePos < 0) this.basePos = 0;
+    }
+  }
+
+  /** 跳到某一步：clamp 0..length-1；播放中重锚到 60ms 后 */
+  seek(step: number): void {
+    this.basePos = Math.max(0, Math.min(this.length - 1, Math.round(step)));
+    this.scheduled.length = 0;
+    if (!this.playing) return;
+    this.anchor = this.audio.now + 0.06;
+    this.nextStep = Math.ceil(this.basePos) % this.length;
+    const offset = Math.ceil(this.basePos) - this.basePos;
+    this.nextTime = this.anchor + offset * this.stepDur;
+  }
+
+  rewind(): void {
+    this.seek(0);
   }
 
   /** 每帧调用：向前调度 + 到点交出视觉事件 */
@@ -240,7 +408,7 @@ export class Clock {
       this.onSchedule(this.nextStep, this.nextTime);
       this.scheduled.push({ time: this.nextTime, step: this.nextStep });
       this.nextTime += this.stepDur;
-      this.nextStep = (this.nextStep + 1) % 16;
+      this.nextStep = (this.nextStep + 1) % this.length;
     }
   }
 
