@@ -13,6 +13,7 @@ export class Hud {
   onSeek: ((step: number) => void) | null = null;
   onRewind: (() => void) | null = null;
   onSettings: (() => void) | null = null;
+  onExamples: (() => void) | null = null;
 
   private playBtn = document.querySelector<HTMLButtonElement>('#play')!;
   private rewindBtn = document.querySelector<HTMLButtonElement>('#rewind')!;
@@ -25,6 +26,7 @@ export class Hud {
   private clearBtn = document.querySelector<HTMLButtonElement>('#clear')!;
   private shareBtn = document.querySelector<HTMLButtonElement>('#share')!;
   private settingsBtn = document.querySelector<HTMLButtonElement>('#settings')!;
+  private examplesBtn = document.querySelector<HTMLButtonElement>('#examples')!;
   private measureEl = document.querySelector<HTMLElement>('#measure')!;
   private barsEl = document.querySelector<HTMLElement>('#bars')!;
   private rail = document.querySelector<HTMLElement>('#rail')!;
@@ -57,6 +59,7 @@ export class Hud {
     this.clearBtn.addEventListener('click', () => this.onClear?.());
     this.shareBtn.addEventListener('click', () => this.onShare?.());
     this.settingsBtn.addEventListener('click', () => this.onSettings?.());
+    this.examplesBtn.addEventListener('click', () => this.onExamples?.());
     document.querySelectorAll<HTMLButtonElement>('[data-bpm]').forEach((btn) => {
       btn.addEventListener('click', () => this.onBpm?.(Number(btn.dataset.bpm)));
     });
@@ -159,6 +162,12 @@ export class Hud {
     this.settingsBtn.classList.toggle('is-on', open);
     this.settingsBtn.setAttribute('aria-expanded', String(open));
     this.settingsBtn.setAttribute('aria-label', open ? '关闭设置' : '设置');
+  }
+
+  setExamplesOpen(open: boolean): void {
+    this.examplesBtn.classList.toggle('is-on', open);
+    this.examplesBtn.setAttribute('aria-expanded', String(open));
+    this.examplesBtn.setAttribute('aria-label', open ? '关闭示例' : '示例');
   }
 
   setBpm(bpm: number): void {

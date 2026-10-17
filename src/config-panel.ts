@@ -16,6 +16,8 @@ export interface ConfigSnapshot {
   windowCols: number;
   masterGain: number;
   reverb: number;
+  /** 备份槽里是否有可恢复的作品 */
+  canRestore: boolean;
 }
 
 export interface ConfigHandlers {
@@ -27,6 +29,7 @@ export interface ConfigHandlers {
   masterGain(value: number, phase: GesturePhase): void;
   reverb(value: number, phase: GesturePhase): void;
   share(): void;
+  restore(): void;
   clear(): void;
 }
 
@@ -60,6 +63,7 @@ export class ConfigPanel {
   private readonly reverbOut = el('output', 'cfg-num', '16%');
   private readonly autosave = el('p', 'cfg-note', '自动存档 · 刚刚');
   private readonly shareBtn = el('button', 'cfg-btn', '复制分享链接');
+  private readonly restoreBtn = el('button', 'cfg-btn', '恢复上次载入前的作品');
   private readonly clearBtn = el('button', 'cfg-btn cfg-btn--danger', '清空舞台');
 
   private readonly barsDec = el('button', 'cfg-step', '−');
@@ -76,6 +80,7 @@ export class ConfigPanel {
     windowCols: 16,
     masterGain: 0.82,
     reverb: 0.16,
+    canRestore: false,
   };
   private gesture: SliderKind | null = null;
 
@@ -90,6 +95,7 @@ export class ConfigPanel {
     this.reverbOut.id = 'cfg-reverb-out';
     this.autosave.id = 'cfg-autosave';
     this.shareBtn.id = 'cfg-share';
+    this.restoreBtn.id = 'cfg-restore';
     this.clearBtn.id = 'cfg-clear';
     this.barsDec.id = 'cfg-bars-dec';
     this.barsInc.id = 'cfg-bars-inc';
@@ -115,6 +121,7 @@ export class ConfigPanel {
       this.section('数据', [
         this.autosave,
         this.shareBtn,
+        this.restoreBtn,
         this.clearBtn,
       ]),
     );
@@ -125,6 +132,7 @@ export class ConfigPanel {
     this.bindSwitch(this.loopSwitch, () => this.handlers.loop(!this.snapshot.loop));
     this.bindSwitch(this.infiniteSwitch, () => this.handlers.infinite(!this.snapshot.infinite));
     this.shareBtn.addEventListener('click', () => this.handlers.share());
+    this.restoreBtn.addEventListener('click', () => this.handlers.restore());
     this.clearBtn.addEventListener('click', () => this.handlers.clear());
     this.bindSlider('bpm', this.bpmInput, (value, phase) => this.handlers.bpm(value, phase), (value) => {
       this.bpmOut.textContent = String(value);
@@ -137,6 +145,7 @@ export class ConfigPanel {
     });
 
     this.clearBtn.disabled = true;
+    this.restoreBtn.disabled = true;
   }
 
   sync(next: ConfigSnapshot): void {
@@ -160,6 +169,8 @@ export class ConfigPanel {
     }
     this.clearBtn.disabled = next.notes === 0;
     this.clearBtn.setAttribute('aria-label', next.notes === 0 ? '舞台已经是空的' : '清空舞台');
+    this.restoreBtn.disabled = !next.canRestore;
+    this.restoreBtn.setAttribute('aria-label', next.canRestore ? '恢复上次载入前的作品' : '没有可恢复的作品');
   }
 
   /** 数据区的自动存档读数 */

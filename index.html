@@ -105,6 +105,22 @@
             </svg>
           </button>
           <button
+            id="examples"
+            class="icon-btn icon-btn--sm"
+            type="button"
+            aria-label="示例"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+            title="示例 (E)"
+          >
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="4" y="4" width="6.6" height="6.6" rx="1.4" stroke="currentColor" stroke-width="1.6" fill="none" />
+              <rect x="13.4" y="4" width="6.6" height="6.6" rx="1.4" stroke="currentColor" stroke-width="1.6" fill="none" />
+              <rect x="4" y="13.4" width="6.6" height="6.6" rx="1.4" stroke="currentColor" stroke-width="1.6" fill="none" />
+              <rect x="13.4" y="13.4" width="6.6" height="6.6" rx="1.4" stroke="currentColor" stroke-width="1.6" fill="none" />
+            </svg>
+          </button>
+          <button
             id="settings"
             class="icon-btn icon-btn--sm"
             type="button"
@@ -148,7 +164,7 @@
 
     <div id="hint" class="hint">
       <span class="hint-line">网格上拖动画音符 · 背景拖拽转视角 · 右键删除</span>
-      <span class="hint-sub">1/2/3 视角 · 滚轮音高 · 空格播放</span>
+      <span class="hint-sub">1/2/3 视角 · 滚轮音高 · E 示例 · 空格播放</span>
     </div>
 
     <footer class="transport" aria-label="播放控制">
@@ -221,6 +237,26 @@
         </button>
       </div>
       <div id="settings-body" class="drawer-body"></div>
+    </aside>
+
+    <aside
+      id="examples-panel"
+      class="drawer"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="examples-title"
+      aria-hidden="true"
+      hidden
+    >
+      <div class="drawer-head">
+        <h2 id="examples-title" class="drawer-title">示例</h2>
+        <button id="examples-close" class="drawer-close" type="button" aria-label="关闭示例">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M7 7l10 10M17 7 7 17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+        </button>
+      </div>
+      <div id="examples-body" class="drawer-body"></div>
     </aside>
 
     <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden>

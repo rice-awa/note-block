@@ -338,6 +338,79 @@ export function clearLocal(): void {
   }
 }
 
+// ---------------------------------------------------------------- 备份槽
+
+/** 载入示例 / 清空前保存上一份作品，跨刷新也能找回；与自动存档分开 */
+export const BACKUP_KEY: string = 'note-block:backup:v1';
+
+export interface Backup {
+  state: SongState;
+  /** 保存时间（ms） */
+  at: number;
+  /** 来源说明，例如「载入《雨林》前」 */
+  label: string;
+}
+
+/** 写入备份槽：只保留最近一份 */
+export function saveBackup(state: SongState, label: string): void {
+  try {
+    const store = getStorage();
+    if (!store) return;
+    const payload = {
+      v: VERSION,
+      at: Date.now(),
+      label,
+      state: {
+        notes: normalizeNotes(state.notes),
+        bpm: clampBpm(state.bpm),
+        infinite: state.infinite === true,
+        bars: clampBars(state.bars),
+        loop: state.loop !== false,
+      },
+    };
+    store.setItem(BACKUP_KEY, JSON.stringify(payload));
+  } catch {
+    /* 静默失败，不打断演奏 */
+  }
+}
+
+/** 读取备份槽：结构不合法返回 null */
+export function loadBackup(): Backup | null {
+  try {
+    const store = getStorage();
+    const raw = store?.getItem(BACKUP_KEY);
+    if (!raw) return null;
+    const data: unknown = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return null;
+    const obj = data as Record<string, unknown>;
+    if (obj.v !== VERSION || !obj.state || typeof obj.state !== 'object') return null;
+    const state = obj.state as Record<string, unknown>;
+    if (!Array.isArray(state.notes)) return null;
+    const at = typeof obj.at === 'number' && Number.isFinite(obj.at) ? obj.at : 0;
+    const label = typeof obj.label === 'string' ? obj.label : '';
+    return { state: normalizeState(state as unknown as SongStateInput), at, label };
+  } catch {
+    return null;
+  }
+}
+
+/** 备份槽是否有内容（同步面板按钮状态用，不做完整解析） */
+export function hasBackup(): boolean {
+  try {
+    return !!getStorage()?.getItem(BACKUP_KEY);
+  } catch {
+    return false;
+  }
+}
+
+export function clearBackup(): void {
+  try {
+    getStorage()?.removeItem(BACKUP_KEY);
+  } catch {
+    /* 静默失败 */
+  }
+}
+
 /** 快照式撤销栈：保存「修改前」状态 */
 export class History {
   private readonly limit: number;

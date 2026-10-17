@@ -640,11 +640,16 @@ export class Studio {
     return this.blocks.size;
   }
 
-  setSong(notes: Note[], animated = false): void {
+  /**
+   * 整首装配。columnDelay > 0 时按列波次出现（示例载入的 14ms/列），
+   * 否则沿用每块自带的行/步错峰。
+   */
+  setSong(notes: Note[], animated = false, columnDelay = 0): void {
     this.clear();
     const sorted = [...notes].sort((a, b) => a.step - b.step || a.row - b.row);
     for (const note of sorted) {
-      this.addBlock(note.step, note.row, note.midi, animated);
+      const delay = animated && columnDelay > 0 ? note.step * columnDelay : undefined;
+      this.addBlock(note.step, note.row, note.midi, animated, delay);
     }
   }
 

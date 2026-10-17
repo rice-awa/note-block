@@ -2,19 +2,25 @@ import './style.css';
 import { AudioEngine, Clock } from './audio';
 import { ConfigPanel, type GesturePhase } from './config-panel';
 import { Drawer } from './drawer';
+import { ExamplePanel } from './example-panel';
+import { EXAMPLES, type Example } from './examples';
 import { Hud } from './hud';
 import { clampWindowCols, loadPrefs, savePrefs, type Prefs } from './prefs';
 import { COLS, DEMO, MAX_MIDI, MIN_MIDI, ROWS } from './rows';
 import { Studio, type BlockView, type Cell, type PaintCell } from './scene';
 import {
   clampBars,
+  clearBackup,
   decodeSong,
+  hasBackup,
   History,
+  loadBackup,
   loadLocal,
   MAX_BARS,
   MAX_STEPS,
   normalizeState,
   readShareCode,
+  saveBackup,
   saveLocal,
   shareUrl,
   type Note,
@@ -112,6 +118,7 @@ function syncPanel(): void {
     windowCols: prefs.windowCols,
     masterGain: audio.masterGain,
     reverb: audio.reverbSend,
+    canRestore: hasBackup(),
   });
 }
 
@@ -135,7 +142,7 @@ function applyState(next: SongStateInput, animate = false): void {
   clock.setLoop(loop);
   clock.setBpm(state.bpm);
   hud.setBpm(clock.bpm);
-  studio.setSong(state.notes, animate);
+  studio.setSong(state.notes, animate, animate ? 0.014 : 0);
   syncLength();
   clock.seek(Math.min(clock.position, clock.length - 1));
   viewOffset = 0;
@@ -147,6 +154,7 @@ function applyState(next: SongStateInput, animate = false): void {
   hud.setProgress(clock.position, clock.length);
   hud.setEmpty(studio.blockCount === 0);
   markDirty();
+  if (examplesDrawer?.isOpen) examplePanel?.refresh();
 }
 
 function undo(animated = false): void {
@@ -390,7 +398,14 @@ hud.onClear = clearAll;
 hud.onShare = () => void share();
 hud.onSeek = seekTo;
 studio.onViewChange = (id) => hud.setView(id);
-hud.onSettings = () => drawer.toggle();
+hud.onSettings = () => {
+  examplesDrawer?.hide();
+  drawer.toggle();
+};
+hud.onExamples = () => {
+  drawer.hide();
+  examplesDrawer?.toggle();
+};
 clock.onEnd = () => {
   hud.setPlaying(false);
   hud.setAtEnd(true);
@@ -409,6 +424,7 @@ const configPanel = new ConfigPanel(document.querySelector<HTMLElement>('#settin
   masterGain: (value) => setMasterGain(value),
   reverb: (value) => setReverb(value),
   share: () => void share(),
+  restore: () => restoreBackup(),
   clear: clearAll,
 });
 
@@ -424,6 +440,66 @@ const drawer = new Drawer({
   },
   onClose: () => hud.setSettingsOpen(false),
 });
+
+// ---------------------------------------------------------------- 示例抽屉
+
+let examplePanel: ExamplePanel | null = null;
+let examplesDrawer: Drawer | null = null;
+
+examplePanel = new ExamplePanel(document.querySelector<HTMLElement>('#examples-body')!, {
+  getState: capture,
+  onLoad: (example) => loadExample(example),
+});
+
+examplesDrawer = new Drawer({
+  panel: document.querySelector<HTMLElement>('#examples-panel')!,
+  scrim: document.querySelector<HTMLElement>('#drawer-scrim'),
+  trigger: document.querySelector<HTMLElement>('#examples'),
+  closeButton: document.querySelector<HTMLElement>('#examples-close'),
+  onOpen: () => {
+    hud.setExamplesOpen(true);
+    examplePanel?.refresh();
+  },
+  onClose: () => hud.setExamplesOpen(false),
+});
+
+/** 载入示例：先备份当前作品，再按列波次装配；撤销栈只留一条，Ctrl+Z 回到载入前 */
+function loadExample(example: Example): void {
+  void unlock();
+  saveBackup(capture(), `载入《${example.name}》前`);
+  hud.hideToast();
+  history.push(capture());
+  applyState(
+    {
+      notes: example.notes,
+      bpm: example.bpm,
+      infinite: example.infinite,
+      bars: example.bars,
+      loop: true,
+    },
+    true,
+  );
+  examplePanel?.refresh();
+  hud.showToast(`已载入《${example.name}》`, '撤销', () => undo(true), 5600);
+  hud.dismissHint();
+}
+
+/** 从备份槽恢复上次载入示例/清空前的内容，跨刷新可用 */
+function restoreBackup(): boolean {
+  const backup = loadBackup();
+  if (!backup) {
+    hud.showToast('没有可恢复的作品', null, null, 2200);
+    return false;
+  }
+  void unlock();
+  hud.hideToast();
+  history.push(capture());
+  applyState(backup.state, true);
+  clearBackup();
+  syncPanel();
+  hud.showToast(backup.label ? `已恢复：${backup.label}` : '已恢复上次载入前的作品', null, null, 3400);
+  return true;
+}
 
 // ---------------------------------------------------------------- boot
 
@@ -947,10 +1023,23 @@ window.addEventListener('keydown', (e) => {
     drawer.toggle();
     return;
   }
-  if (e.key === 'Escape' && drawer.isOpen) {
+  if (e.key === 'e' || e.key === 'E') {
     e.preventDefault();
     drawer.hide();
+    examplesDrawer?.toggle();
     return;
+  }
+  if (e.key === 'Escape') {
+    if (drawer.isOpen) {
+      e.preventDefault();
+      drawer.hide();
+      return;
+    }
+    if (examplesDrawer?.isOpen) {
+      e.preventDefault();
+      examplesDrawer.hide();
+      return;
+    }
   }
   if (e.key === '1' || e.key === '2' || e.key === '3') {
     const id = e.key === '1' ? 'persp' : e.key === '2' ? 'top' : 'front';
@@ -1022,6 +1111,12 @@ Object.assign(window, {
   __hud: hud,
   __config: configPanel,
   __drawer: drawer,
+  get __examplesDrawer() {
+    return examplesDrawer;
+  },
+  get __examples() {
+    return examplePanel;
+  },
 });
 Object.assign(window, {
   __nb: {
@@ -1037,6 +1132,19 @@ Object.assign(window, {
     setBars,
     setLoop,
     setWindowCols,
+    loadExample: (id: string) => {
+      const example = EXAMPLES.find((e) => e.id === id);
+      if (example) loadExample(example);
+      return !!example;
+    },
+    restoreBackup,
+    backup: () => loadBackup(),
+    hasBackup: () => hasBackup(),
+    examples: EXAMPLES,
+    openExamples: () => {
+      drawer.hide();
+      examplesDrawer?.show();
+    },
     syncLength,
     decode: decodeSong,
     get infinite() {
