@@ -2,29 +2,43 @@ import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { clamp, damp, projectMomentum, Spring, tiltFromVelocity } from './motion';
+import { clampWindowCols, WINDOW_COLS_MAX, WINDOW_COLS_MIN, WINDOW_COLS_STEP } from './prefs';
 import { BASE_MIDI, COLS, MAX_MIDI, MIN_MIDI, ROWS, ROW_COUNT } from './rows';
 import { MAX_STEPS, type Note } from './song';
 import { fitDistance, VIEW_ORDER, VIEWS, type ViewId } from './views';
 
 const CELL = 1;
-const X0 = -COLS / 2; // -8
 const Z0 = -ROW_COUNT / 2; // -4
 const BLOCK_Y = 0.5;
 const LIFT_Y = 0.94;
-const WINDOW = COLS;
+
+/**
+ * 坐标解耦（v0.3 / M4）：方块局部坐标只依赖 step，窗口偏移全部落在 songGroup。
+ *   block local x = step + 0.5
+ *   songGroup.x   = -W/2 - viewStart
+ *   world x       = step + 0.5 - W/2 - viewStart
+ * 默认 W = 16 时与 v0.2 逐像素等价（v0.2 的 X0 = -8 已经合进 songGroup 的 -W/2）。
+ */
+const cellX = (step: number): number => step + 0.5;
+const cellZ = (row: number): number => Z0 + row + 0.5;
+/** 曲内局部 x → 步（取最近的格心） */
+const stepFromX = (x: number): number => Math.round(x - 0.5);
+/** 曲内局部 x → 步（格内 floor，绘制用） */
+const stepFromXFloor = (x: number): number => Math.floor(x);
+const rowFromZ = (z: number): number => Math.round(z - Z0 - 0.5);
 
 /** 舞台的包围盒半尺寸，用于相机 fit（比石板本身略大，留出安全边） */
-const STAGE_HALF_W = 9.2;
+const STAGE_HALF_W_PAD = 1.2; // v0.2 的 9.2 = 16/2 + 1.2，默认构图保持不变
 const STAGE_HALF_D = 5.4;
 const STAGE_TOP_Y = 1.7;
+/** 石板半宽 = W/2 + 0.9（默认 8.9 → 宽 17.8）；底座半宽 = W/2 + 1.25（默认 18.5） */
+const SLAB_PAD = 0.9;
+const BASE_PAD = 1.25;
+/** 边缘手柄中心挂在石板边缘（比网格边缘外 0.9 格），命中区不在网格内 */
+const HANDLE_EDGE_PAD = SLAB_PAD;
 
 const prefersReducedMotion = (): boolean =>
   typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-const cellX = (step: number): number => X0 + step + 0.5;
-const cellZ = (row: number): number => Z0 + row + 0.5;
-const stepFromX = (x: number): number => Math.round(x - X0 - 0.5);
-const rowFromZ = (z: number): number => Math.round(z - Z0 - 0.5);
 
 export interface Cell {
   step: number;
@@ -41,6 +55,10 @@ export interface ScreenPoint {
   clientX: number;
   clientY: number;
 }
+
+export type HandleSide = 'left' | 'right';
+/** 边缘拖拽的三个阶段：按下 / 变换中 / 松手（含 Esc 取消） */
+export type ResizePhase = 'start' | 'move' | 'end';
 
 export interface BlockView {
   step: number;
@@ -99,7 +117,7 @@ export class Studio {
 
   readonly blocks = new Map<string, BlockView>();
   private readonly blockGroup = new THREE.Group();
-  /** 所有"跟着曲子走"的东西都挂在这里：只动 position.x = -viewStart */
+  /** 所有"跟着曲子走"的东西都挂在这里：只动 position.x = -W/2 - viewStart */
   private readonly songGroup = new THREE.Group();
   private readonly stepIndex = new Map<number, BlockView[]>();
   private viewStart = 0;
@@ -112,6 +130,55 @@ export class Studio {
   private readonly textures = new Map<string, THREE.Texture>();
   private readonly floorTextures = new Map<string, THREE.Texture>();
   private readonly maxAniso: number;
+
+  /** 可见列数（8..32，4 列吸附）：拖边缘或配置面板都改它 */
+  private windowColsValue = COLS;
+  /** 每次重建舞台几何的耗时（ms），给性能验收用 */
+  private rebuildMs = 0;
+  /** 舞台变宽/变窄后通知外部（main 负责偏好、音效、滚动能力） */
+  onResize: ((cols: number, phase: ResizePhase) => void) | null = null;
+
+  private slab: THREE.Mesh | null = null;
+  private base: THREE.Mesh | null = null;
+  private veil: THREE.Mesh | null = null;
+  private readonly floorPlanes: THREE.Mesh[] = [];
+  private hLines: THREE.LineSegments | null = null;
+  private slabMat!: THREE.MeshStandardMaterial;
+  private baseMat!: THREE.MeshStandardMaterial;
+  private veilMat!: THREE.MeshBasicMaterial;
+  private hLineMat!: THREE.LineBasicMaterial;
+  private readonly floorMats: Record<string, THREE.MeshStandardMaterial> = {};
+  private keyLight!: THREE.DirectionalLight;
+
+  private handles: { left: HTMLDivElement; right: HTMLDivElement } | null = null;
+  private capsule: HTMLDivElement | null = null;
+  /** 手柄屏幕中心（每帧投影石板边缘中点） */
+  private readonly handleScreen: Record<HandleSide, { x: number; y: number }> = {
+    left: { x: 0, y: 0 },
+    right: { x: 0, y: 0 },
+  };
+  /** 网格边缘中点的屏幕位置（淡入判定用） */
+  private readonly edgeScreen: Record<HandleSide, { x: number; y: number }> = {
+    left: { x: 0, y: 0 },
+    right: { x: 0, y: 0 },
+  };
+  /** 手柄"落位"弹簧：松手后从手指位置弹回吸附后的边缘 */
+  private readonly handleSpring: Record<HandleSide, Spring> = {
+    left: new Spring(0, 0.35, 0.9),
+    right: new Spring(0, 0.35, 0.9),
+  };
+  private handleNear: HandleSide | null = null;
+  private resizeDrag: {
+    side: HandleSide;
+    pointerId: number;
+    startCols: number;
+    startWorldX: number;
+    startView: number;
+    clientX: number;
+    clientY: number;
+    /** 拖动中"想要"的半宽（未吸附、未夹住），手柄跟手用 */
+    rawHalfW: number;
+  } | null = null;
 
   private gridThin!: { lines: THREE.LineSegments; pos: Float32Array; attr: THREE.BufferAttribute };
   private gridBold!: { lines: THREE.LineSegments; pos: Float32Array; attr: THREE.BufferAttribute };
@@ -166,9 +233,10 @@ export class Studio {
     this.scene.add(this.songGroup);
 
     this.buildEnvironment();
+    this.buildMaterials();
     this.buildStage();
-    this.buildFloor();
     this.buildProps();
+    this.buildHandles();
     this.resize();
   }
 
@@ -192,6 +260,7 @@ export class Studio {
     key.shadow.normalBias = 0.025;
     key.shadow.radius = 3;
     this.scene.add(key);
+    this.keyLight = key;
 
     const fill = new THREE.DirectionalLight(0xdfe8ff, 0.3);
     fill.position.set(9, 5, -7);
@@ -217,23 +286,28 @@ export class Studio {
     this.scene.add(shadowPlane);
   }
 
-  private buildStage(): void {
-    const slab = new THREE.Mesh(
-      new RoundedBoxGeometry(17.8, 0.62, 9.8, 6, 0.16),
-      new THREE.MeshStandardMaterial({ color: 0xfbf7ee, roughness: 0.94, metalness: 0 }),
-    );
-    slab.position.y = -0.33;
-    slab.receiveShadow = true;
-    slab.castShadow = true;
-    this.scene.add(slab);
+  /** 材质与贴图只建一次：舞台宽度变化时复用（贴图只改 repeat） */
+  private buildMaterials(): void {
+    this.slabMat = new THREE.MeshStandardMaterial({ color: 0xfbf7ee, roughness: 0.94, metalness: 0 });
+    this.baseMat = new THREE.MeshStandardMaterial({ color: 0xeee5d4, roughness: 0.96, metalness: 0 });
+    this.veilMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07, depthWrite: false });
+    this.hLineMat = new THREE.LineBasicMaterial({ color: 0x6b5c47, transparent: true, opacity: 0.22, depthWrite: false });
 
-    const base = new THREE.Mesh(
-      new RoundedBoxGeometry(18.5, 0.34, 10.5, 5, 0.15),
-      new THREE.MeshStandardMaterial({ color: 0xeee5d4, roughness: 0.96, metalness: 0 }),
-    );
-    base.position.y = -0.78;
-    base.receiveShadow = true;
-    this.scene.add(base);
+    ROWS.forEach((row) => {
+      const floorTex = this.loadFloorTexture(row.tex);
+      this.floorTextures.set(row.key, floorTex);
+      this.floorMats[row.key] = new THREE.MeshStandardMaterial({
+        map: floorTex,
+        roughness: 0.96,
+        metalness: 0,
+        transparent: !!row.cutout,
+        alphaTest: row.cutout ? 0.3 : 0,
+      });
+      // 方块用的贴图：不重复
+      this.textures.set(row.key, this.loadTexture(row.tex));
+    });
+
+    this.buildGrid();
   }
 
   private loadTexture(name: string, repeatX = 1, repeatY = 1): THREE.Texture {
@@ -257,7 +331,7 @@ export class Studio {
     tex.anisotropy = this.maxAniso;
     tex.wrapS = THREE.RepeatWrapping;
     tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(COLS, 1);
+    tex.repeat.set(this.windowColsValue, 1);
     const placeholder = document.createElement('canvas');
     placeholder.width = placeholder.height = 1;
     const pctx = placeholder.getContext('2d');
@@ -284,50 +358,11 @@ export class Studio {
     return tex;
   }
 
-  private buildFloor(): void {
-    ROWS.forEach((row, r) => {
-      const floorTex = this.loadFloorTexture(row.tex);
-      this.floorTextures.set(row.key, floorTex);
-      const mat = new THREE.MeshStandardMaterial({
-        map: floorTex,
-        roughness: 0.96,
-        metalness: 0,
-        transparent: !!row.cutout,
-        alphaTest: row.cutout ? 0.3 : 0,
-      });
-      const plane = new THREE.Mesh(new THREE.PlaneGeometry(COLS * CELL, CELL), mat);
-      plane.rotation.x = -Math.PI / 2;
-      plane.position.set(0, 0.001, cellZ(r));
-      plane.receiveShadow = true;
-      this.scene.add(plane);
-
-      // 方块用的贴图：不重复
-      this.textures.set(row.key, this.loadTexture(row.tex));
-    });
-
-    const veil = new THREE.Mesh(
-      new THREE.PlaneGeometry(COLS * CELL, ROW_COUNT * CELL),
-      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07, depthWrite: false }),
-    );
-    veil.rotation.x = -Math.PI / 2;
-    veil.position.y = 0.003;
-    this.scene.add(veil);
-
-    // 横向分隔线（不随时间滚动）
-    const horizontal: number[] = [];
-    for (let j = 0; j <= ROW_COUNT; j++) {
-      const z = Z0 + j;
-      horizontal.push(X0, 0, z, X0 + COLS, 0, z);
-    }
-    const hg = new THREE.BufferGeometry();
-    hg.setAttribute('position', new THREE.Float32BufferAttribute(horizontal, 3));
-    const hLines = new THREE.LineSegments(
-      hg,
-      new THREE.LineBasicMaterial({ color: 0x6b5c47, transparent: true, opacity: 0.22, depthWrite: false }),
-    );
-    hLines.position.y = 0.006;
-    this.scene.add(hLines);
-
+  /**
+   * 竖向网格：容量一次按最大列数分配（32 + 4 / 32/4 + 4），
+   * 宽度变化时不用重建缓冲，只改每帧写入的顶点数（见 updateGrid）。
+   */
+  private buildGrid(): void {
     // 竖向分隔线：无限模式下必须跟着 viewStart 滚，否则格线和音符会错位。
     // 只画窗口内可见的绝对步边界，每帧重写这几十个顶点，比"传送带"更简单也更准。
     const mkMovingGrid = (capacity: number, opacity: number) => {
@@ -346,8 +381,85 @@ export class Studio {
       this.scene.add(lines);
       return { lines, pos, attr };
     };
-    this.gridThin = mkMovingGrid(COLS + 4, 0.2);
-    this.gridBold = mkMovingGrid(COLS / 4 + 4, 0.47);
+    this.gridThin = mkMovingGrid(WINDOW_COLS_MAX + 4, 0.2);
+    this.gridBold = mkMovingGrid(WINDOW_COLS_MAX / WINDOW_COLS_STEP + 4, 0.47);
+  }
+
+  /**
+   * 舞台几何只建一次（按默认 W=16 的原尺寸 = v0.2 的逐像素基准），
+   * 宽度变化时只改 scale / 贴图 repeat：零分配，实测 <0.1ms（见 resizeStage）。
+   * 之所以不重建几何：RoundedBoxGeometry(6 段) 单次就 3.3ms，两条就超过 2ms 预算。
+   */
+  private buildStage(): void {
+    const slab = new THREE.Mesh(new RoundedBoxGeometry(COLS + SLAB_PAD * 2, 0.62, 9.8, 6, 0.16), this.slabMat);
+    slab.position.y = -0.33;
+    slab.receiveShadow = true;
+    slab.castShadow = true;
+    this.scene.add(slab);
+    this.slab = slab;
+
+    const base = new THREE.Mesh(new RoundedBoxGeometry(COLS + BASE_PAD * 2, 0.34, 10.5, 5, 0.15), this.baseMat);
+    base.position.y = -0.78;
+    base.receiveShadow = true;
+    this.scene.add(base);
+    this.base = base;
+
+    ROWS.forEach((row, r) => {
+      const plane = new THREE.Mesh(new THREE.PlaneGeometry(COLS * CELL, CELL), this.floorMats[row.key]);
+      plane.rotation.x = -Math.PI / 2;
+      plane.position.set(0, 0.001, cellZ(r));
+      plane.receiveShadow = true;
+      this.scene.add(plane);
+      this.floorPlanes.push(plane);
+    });
+
+    const veil = new THREE.Mesh(new THREE.PlaneGeometry(COLS * CELL, ROW_COUNT * CELL), this.veilMat);
+    veil.rotation.x = -Math.PI / 2;
+    veil.position.y = 0.003;
+    this.scene.add(veil);
+    this.veil = veil;
+
+    // 横向分隔线（不随时间滚动）：按默认宽度建，宽度变化时只缩放 x
+    const horizontal: number[] = [];
+    for (let j = 0; j <= ROW_COUNT; j++) {
+      const z = Z0 + j;
+      horizontal.push(-COLS / 2, 0, z, COLS / 2, 0, z);
+    }
+    const hg = new THREE.BufferGeometry();
+    hg.setAttribute('position', new THREE.Float32BufferAttribute(horizontal, 3));
+    const hLines = new THREE.LineSegments(hg, this.hLineMat);
+    hLines.position.y = 0.006;
+    this.scene.add(hLines);
+    this.hLines = hLines;
+
+    this.resizeStage();
+  }
+
+  /** 跨过 4 列吸附时执行：改 slab/base/地板/veil/水平线的 x 缩放与地板贴图 repeat */
+  private resizeStage(): void {
+    const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
+    const cols = this.windowColsValue;
+    const k = cols / COLS;
+    if (!this.slab || !this.base || !this.veil || !this.hLines) return;
+    this.slab.scale.x = (cols + SLAB_PAD * 2) / (COLS + SLAB_PAD * 2);
+    this.base.scale.x = (cols + BASE_PAD * 2) / (COLS + BASE_PAD * 2);
+    this.veil.scale.x = k;
+    this.hLines.scale.x = k;
+    for (const plane of this.floorPlanes) plane.scale.x = k;
+    for (const tex of this.floorTextures.values()) tex.repeat.set(cols, 1);
+    this.rebuildMs = typeof performance !== 'undefined' ? performance.now() - t0 : 0;
+  }
+
+  /** 阴影相机范围随宽度扩：默认 W=16 时仍是 ±14，和 v0.2 一致 */
+  private updateShadowCamera(): void {
+    const r = Math.max(14, this.halfW + 6);
+    const cam = this.keyLight.shadow.camera as THREE.OrthographicCamera;
+    if (cam.right === r && cam.top === r) return;
+    cam.left = -r;
+    cam.right = r;
+    cam.top = r;
+    cam.bottom = -r;
+    cam.updateProjectionMatrix();
   }
 
   private blockTexture(row: number): THREE.Texture {
@@ -443,7 +555,7 @@ export class Studio {
     head.castShadow = true;
     this.playhead.add(head);
 
-    this.playhead.position.x = X0 + 0.2;
+    this.playhead.position.x = 0.2;
     this.songGroup.add(this.playhead);
 
     this.dust = new Dust(this.songGroup);
@@ -485,6 +597,8 @@ export class Studio {
 
   /** QA / 调试：把某个格子中心投到画布 CSS 像素坐标（y=0 是地板拾取面） */
   cellToScreen(step: number, row: number, y = BLOCK_Y, zf = 0.5): { x: number; y: number } {
+    // 不依赖上一帧的 render()：直接刷新世界矩阵，QA/测试在任意时刻调用都准
+    this.songGroup.updateWorldMatrix(true, false);
     const v = new THREE.Vector3(cellX(step), y, Z0 + row + zf);
     this.songGroup.localToWorld(v);
     this.camera.updateMatrixWorld();
@@ -682,7 +796,7 @@ export class Studio {
 
   /** 目标窗口左缘（步）。snap=true 用于 seek / 模式切换，普通跟随走阻尼 */
   setWindow(target: number, snap = false): void {
-    const maxStart = Math.max(0, MAX_STEPS - WINDOW);
+    const maxStart = Math.max(0, MAX_STEPS - this.windowColsValue);
     this.viewStartTarget = clamp(target, 0, maxStart);
     if (!this.scrollable) {
       this.viewStart = 0;
@@ -694,17 +808,17 @@ export class Studio {
   }
 
   private applyWindow(): void {
-    this.songGroup.position.x = -this.viewStart;
+    this.songGroup.position.x = -this.halfW - this.viewStart;
     this.updateGrid();
     this.playhead.visible = this.playheadShown && this.playheadInWindow();
   }
 
   private playheadInWindow(): boolean {
-    return this.playheadPos >= this.viewStart - 0.5 && this.playheadPos <= this.viewStart + WINDOW + 0.5;
+    return this.playheadPos >= this.viewStart - 0.5 && this.playheadPos <= this.viewStart + this.windowColsValue + 0.5;
   }
 
   private inWindow(step: number): boolean {
-    return step >= this.viewStart - 1 && step <= this.viewStart + WINDOW + 1;
+    return step >= this.viewStart - 1 && step <= this.viewStart + this.windowColsValue + 1;
   }
 
   /** 每帧重写可见的绝对步边界；粗线永远落在 4 的倍数上 */
@@ -720,9 +834,10 @@ export class Studio {
       pos[at + 4] = 0;
       pos[at + 5] = Z0 + ROW_COUNT;
     };
-    for (let s = first; s <= first + WINDOW + 1; s++) {
-      const wx = X0 + (s - this.viewStart);
-      if (wx < X0 - 0.001 || wx > X0 + WINDOW + 0.001) continue;
+    const cols = this.windowColsValue;
+    for (let s = first; s <= first + cols + 1; s++) {
+      const wx = s - this.viewStart - cols / 2;
+      if (wx < -cols / 2 - 0.001 || wx > cols / 2 + 0.001) continue;
       if ((((s % 4) + 4) % 4) === 0) {
         if (bi < this.gridBold.pos.length / 6) write(this.gridBold.pos, bi * 6, wx);
         bi++;
@@ -762,7 +877,7 @@ export class Studio {
       this.wipeBand.visible = false;
     } else {
       this.setWipeOpacity(0);
-      this.wipeBand.position.x = X0 - 0.8;
+      this.wipeBand.position.x = -this.halfW - 0.8;
       this.wipeBand.visible = true;
     }
     return count;
@@ -825,17 +940,22 @@ export class Studio {
   }
 
   pointerToCell(e: ScreenPoint): Cell | null {
+    return this.pointerToCellAt(e, this.viewStart);
+  }
+
+  /** 按指定窗口左缘求格（自动滚动 / 拖边缘缩放时用目标窗口位置反算） */
+  private pointerToCellAt(e: ScreenPoint, viewStart: number): Cell | null {
     const p = this.pointOnPlane(e, 0);
     if (!p) return null;
-    const localX = p.x + this.viewStart;
+    const localX = p.x + this.halfW + viewStart;
     const step = stepFromX(localX);
     const row = rowFromZ(p.z);
     if (step < 0 || step >= MAX_STEPS || row < 0 || row >= ROW_COUNT) return null;
-    // 舞台边界要用「舞台内坐标」判定：localX 是曲内绝对坐标，viewStart 后不能直接和 X0 比
-    const stageX = localX - this.viewStart;
-    if (stageX < X0 - 0.5 || stageX > X0 + WINDOW + 0.5) return null;
-    const first = Math.floor(this.viewStart);
-    const last = Math.floor(this.viewStart + WINDOW - 1);
+    // 舞台内坐标 stageX = worldX + W/2 ∈ [-0.5, W + 0.5]，与 viewStart 无关
+    const stageX = p.x + this.halfW;
+    if (stageX < -0.5 || stageX > this.windowColsValue + 0.5) return null;
+    const first = Math.floor(viewStart);
+    const last = Math.floor(viewStart + this.windowColsValue - 1);
     if (step < first || step > last) return null;
     return { step, row };
   }
@@ -852,14 +972,14 @@ export class Studio {
   pointerToCellExactAt(e: ScreenPoint, viewStart: number): PaintCell | null {
     const p = this.pointOnPlane(e, 0);
     if (!p) return null;
-    const localX = p.x + viewStart;
-    const step = Math.floor(localX - X0);
+    const localX = p.x + this.halfW + viewStart;
+    const step = stepFromXFloor(localX);
     const row = Math.floor(p.z - Z0);
     if (step < 0 || step >= MAX_STEPS || row < 0 || row >= ROW_COUNT) return null;
-    const stageX = p.x;
-    if (stageX < X0 - 0.5 || stageX > X0 + WINDOW + 0.5) return null;
+    const stageX = p.x + this.halfW;
+    if (stageX < -0.5 || stageX > this.windowColsValue + 0.5) return null;
     const first = Math.floor(viewStart);
-    const last = Math.floor(viewStart + WINDOW - 1);
+    const last = Math.floor(viewStart + this.windowColsValue - 1);
     if (step < first || step > last) return null;
     return { step, row, lz: p.z };
   }
@@ -890,7 +1010,7 @@ export class Studio {
   beginDrag(block: BlockView, e: PointerEvent): void {
     const p = this.pointOnPlane(e, LIFT_Y + 0.2);
     if (!p) return;
-    const localX = p.x + this.viewStart;
+    const localX = p.x + this.halfW + this.viewStart;
     this.drag = {
       block,
       ox: localX - block.mesh.position.x,
@@ -910,11 +1030,11 @@ export class Studio {
     const p = this.pointOnPlane(e, LIFT_Y + 0.2);
     if (!p) return;
     const b = this.drag.block;
-    const localX = p.x + this.viewStart;
+    const localX = p.x + this.halfW + this.viewStart;
     const nx = clamp(
       localX - this.drag.ox,
-      this.viewStart + X0 - 0.5,
-      this.viewStart + X0 + WINDOW + 0.5,
+      this.viewStart - 0.5,
+      this.viewStart + this.windowColsValue + 0.5,
     );
     const nz = clamp(p.z - this.drag.oz, Z0 - 0.5, Z0 + ROW_COUNT + 0.5);
     const now = performance.now();
@@ -947,9 +1067,10 @@ export class Studio {
     const pz = b.mesh.position.z + throwZ;
     const rawStep = stepFromX(px);
     const rawRow = rowFromZ(pz);
+    // stageX = worldX + W/2 = 曲内局部 x - viewStart，∈ [0, W]
     const stageX = px - this.viewStart;
     const outside =
-      stageX < X0 - 0.45 || stageX > X0 + COLS + 0.45 || pz < Z0 - 0.45 || pz > Z0 + ROW_COUNT + 0.45;
+      stageX < -0.45 || stageX > this.windowColsValue + 0.45 || pz < Z0 - 0.45 || pz > Z0 + ROW_COUNT + 0.45;
 
     if (outside) {
       const { step, row } = b;
@@ -1009,10 +1130,290 @@ export class Studio {
       step: clamp(
         stepFromX(b.mesh.position.x),
         Math.floor(this.viewStart),
-        Math.floor(this.viewStart + WINDOW - 1),
+        Math.floor(this.viewStart + this.windowColsValue - 1),
       ),
       row: clamp(rowFromZ(b.mesh.position.z), 0, ROW_COUNT - 1),
     };
+  }
+
+  // ---------------------------------------------------------------- window width / edge handles
+
+  /** 可见列数（8..32，4 列吸附） */
+  get windowCols(): number {
+    return this.windowColsValue;
+  }
+
+  /** 舞台半宽 W/2：世界坐标里网格恒定占据 [-halfW, +halfW]，内容在里面滑 */
+  get halfW(): number {
+    return this.windowColsValue / 2;
+  }
+
+  /** 相机 fit 用的舞台半尺寸（默认 W=16 时 9.2，与 v0.2 一致） */
+  get stageHalfW(): number {
+    return this.halfW + STAGE_HALF_W_PAD;
+  }
+
+  get isResizing(): boolean {
+    return this.resizeDrag !== null;
+  }
+
+  /** QA：最近一次舞台重建耗时（ms） */
+  get lastRebuildMs(): number {
+    return this.rebuildMs;
+  }
+
+  /** QA：手柄 / 网格边缘的屏幕位置 */
+  get handleScreens(): Record<HandleSide, { x: number; y: number }> {
+    return { left: { ...this.handleScreen.left }, right: { ...this.handleScreen.right } };
+  }
+
+  get edgeScreens(): Record<HandleSide, { x: number; y: number }> {
+    return { left: { ...this.edgeScreen.left }, right: { ...this.edgeScreen.right } };
+  }
+
+  /** QA：落位弹簧当前偏移（px） */
+  get handleOffsets(): Record<HandleSide, number> {
+    return { left: this.handleSpring.left.value, right: this.handleSpring.right.value };
+  }
+
+  /**
+   * 配置面板 / 偏好 / 边缘拖拽的统一入口：内部按 4 列吸附并夹到 8..32。
+   * 外部调用（面板 stepper）不经过 onResize；边缘拖拽自己带 phase 走 applyWindowCols。
+   */
+  setWindowCols(cols: number): void {
+    const next = clampWindowCols(cols);
+    if (next === this.windowColsValue) return;
+    this.applyWindowCols(next);
+  }
+
+  /** phase = null 表示外部调用（面板），不触发 onResize，避免和 main 的 setWindowCols 重复记账 */
+  private applyWindowCols(next: number, phase: ResizePhase | null = null): void {
+    this.windowColsValue = next;
+    this.resizeStage();
+    this.updateShadowCamera();
+    // 窗口变宽后原来的滚动位可能越界：夹回 [0, MAX_STEPS - W]
+    this.setWindow(this.viewStartTarget, true);
+    this.fitView(this.viewId !== 'free');
+    if (phase) this.onResize?.(next, phase);
+  }
+
+  private buildHandles(): void {
+    if (typeof document === 'undefined') return;
+    const mk = (side: HandleSide): HTMLDivElement => {
+      const el = document.createElement('div');
+      el.className = `edge-handle edge-handle--${side}`;
+      el.setAttribute('aria-hidden', 'true');
+      el.dataset.side = side;
+      const bar = document.createElement('span');
+      bar.className = 'edge-handle-bar';
+      el.append(bar);
+      el.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return; // 右键仍走擦除 / 上下文菜单
+        e.preventDefault();
+        e.stopPropagation();
+        this.startResize(side, e);
+      });
+      el.addEventListener('pointerenter', () => this.setHandleNear(side));
+      el.addEventListener('pointerleave', () => this.setHandleNear(null));
+      document.body.append(el);
+      return el;
+    };
+    this.handles = { left: mk('left'), right: mk('right') };
+
+    const capsule = document.createElement('div');
+    capsule.className = 'resize-capsule';
+    capsule.setAttribute('aria-hidden', 'true');
+    document.body.append(capsule);
+    this.capsule = capsule;
+  }
+
+  /** 指针是否靠近网格左/右边缘（18px 内）→ 手柄淡入 */
+  pointerNearEdge(e: ScreenPoint | null): void {
+    if (!this.handles) return;
+    if (!e) {
+      this.setHandleNear(null);
+      return;
+    }
+    let near: HandleSide | null = null;
+    for (const side of ['left', 'right'] as const) {
+      const p = this.edgeScreen[side];
+      if (Math.abs(e.clientX - p.x) <= 18 && Math.abs(e.clientY - p.y) <= 64) {
+        near = side;
+        break;
+      }
+    }
+    this.setHandleNear(near);
+  }
+
+  private setHandleNear(side: HandleSide | null): void {
+    if (side === this.handleNear) return;
+    this.handleNear = side;
+    this.paintHandleState();
+  }
+
+  /** 手柄命中判定：石板边缘 26 × 128 px 的加宽区（触屏由 DOM 44px 命中区兜底） */
+  hitResizeHandle(e: ScreenPoint): HandleSide | null {
+    if (!this.handles) return null;
+    for (const side of ['left', 'right'] as const) {
+      const p = this.handleScreen[side];
+      if (Math.abs(e.clientX - p.x) <= 26 && Math.abs(e.clientY - p.y) <= 64) return side;
+    }
+    return null;
+  }
+
+  private paintHandleState(): void {
+    if (!this.handles) return;
+    for (const side of ['left', 'right'] as const) {
+      const el = this.handles[side];
+      const dragging = this.resizeDrag?.side === side;
+      const visible = dragging || this.handleNear === side;
+      el.classList.toggle('is-visible', visible);
+      el.classList.toggle('is-dragging', dragging);
+    }
+  }
+
+  /**
+   * 按下边缘手柄：进入 resize 状态。命中优先于方块拾取（main 在 pointerdown 里先问这个）。
+   * Esc 取消 → 回到按下时的列数与滚动位。
+   */
+  startResize(side: HandleSide, e: PointerEvent): void {
+    if (this.resizeDrag) return;
+    const p = this.pointOnPlane(e, 0);
+    if (!p) return;
+    this.resizeDrag = {
+      side,
+      pointerId: e.pointerId,
+      startCols: this.windowColsValue,
+      startWorldX: p.x,
+      startView: this.viewStartTarget,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      rawHalfW: this.windowColsValue / 2,
+    };
+    try {
+      (e.currentTarget as HTMLElement | null)?.setPointerCapture(e.pointerId);
+    } catch {
+      /* 合成事件没有真实 pointerId */
+    }
+    window.addEventListener('pointermove', this.onResizeMove, true);
+    window.addEventListener('pointerup', this.onResizeUp, true);
+    window.addEventListener('pointercancel', this.onResizeUp, true);
+    this.paintHandleState();
+    this.showCapsule(e.clientX, e.clientY);
+    this.onResize?.(this.windowColsValue, 'start');
+  }
+
+  private readonly onResizeMove = (e: PointerEvent): void => {
+    const r = this.resizeDrag;
+    if (!r || e.pointerId !== r.pointerId) return;
+    const p = this.pointOnPlane(e, 0);
+    if (!p) return;
+    r.clientX = e.clientX;
+    r.clientY = e.clientY;
+    // 以棋盘中心为锚点对称伸缩：位移 dx（世界列）→ W' = W ± 2dx
+    const dx = p.x - r.startWorldX;
+    const raw = r.startCols + (r.side === 'right' ? 2 : -2) * dx;
+    r.rawHalfW = raw / 2;
+    const bounded = clamp(raw, WINDOW_COLS_MIN, WINDOW_COLS_MAX);
+    const next = clampWindowCols(bounded);
+    // 撞到 8/32 后继续拖：宽度不再变，退化为窗口平移（夹在 0 / 最大滚动位）
+    const overflow = raw - bounded;
+    const pan = r.side === 'right' ? overflow : -overflow;
+    const maxStart = Math.max(0, MAX_STEPS - next);
+    const targetView = clamp(r.startView + pan, 0, maxStart);
+    if (next !== this.windowColsValue) this.applyWindowCols(next, 'move');
+    if (this.scrollable && Math.abs(targetView - this.viewStartTarget) > 1e-6) this.setWindow(targetView, true);
+    // 被夹住（撞边界）时手柄不再跟手：偏移量按夹住后的宽度算
+    this.showCapsule(e.clientX, e.clientY);
+  };
+
+  private readonly onResizeUp = (e: PointerEvent): void => {
+    const r = this.resizeDrag;
+    if (!r || e.pointerId !== r.pointerId) return;
+    this.endResize(false);
+  };
+
+  /** 松手 / Esc：结束 resize，交出落位弹簧 */
+  cancelResize(): void {
+    if (!this.resizeDrag) return;
+    this.endResize(true);
+  }
+
+  private endResize(cancelled: boolean): void {
+    const r = this.resizeDrag;
+    if (!r) return;
+    this.resizeDrag = null;
+    window.removeEventListener('pointermove', this.onResizeMove, true);
+    window.removeEventListener('pointerup', this.onResizeUp, true);
+    window.removeEventListener('pointercancel', this.onResizeUp, true);
+    if (cancelled) {
+      this.setWindowCols(r.startCols);
+      this.setWindow(r.startView, true);
+    }
+    this.hideCapsule();
+    // 弹簧落位（response 0.35 / damping 0.9）：手柄从手指位置弹回吸附后的边缘；
+    // reduced-motion 直接落位，不做回弹
+    if (prefersReducedMotion()) this.handleSpring[r.side].snap(0);
+    else this.handleSpring[r.side].setTarget(0);
+    this.paintHandleState();
+    this.onResize?.(this.windowColsValue, 'end');
+  }
+
+  private showCapsule(x: number, y: number): void {
+    const c = this.capsule;
+    if (!c) return;
+    const cols = this.windowColsValue;
+    c.textContent = `${cols / WINDOW_COLS_STEP} 小节 · ${cols} 列`;
+    c.dataset.cols = String(cols);
+    const pad = 18;
+    const w = typeof innerWidth === 'number' ? innerWidth : 0;
+    const h = typeof innerHeight === 'number' ? innerHeight : 0;
+    const left = Math.min(Math.max(x + pad, pad), Math.max(pad, w - 132));
+    const top = Math.min(Math.max(y - 14, 56), Math.max(56, h - 72));
+    c.style.transform = `translate3d(${left}px, ${top}px, 0)`;
+    c.classList.add('is-visible');
+  }
+
+  private hideCapsule(): void {
+    this.capsule?.classList.remove('is-visible');
+  }
+
+  /** 世界点 → 画布 CSS 像素 */
+  private projectWorld(x: number, y: number, z: number): { x: number; y: number } {
+    const v = new THREE.Vector3(x, y, z);
+    this.camera.updateMatrixWorld();
+    v.project(this.camera);
+    const rect = this.canvas.getBoundingClientRect();
+    return {
+      x: rect.left + (v.x * 0.5 + 0.5) * rect.width,
+      y: rect.top + (-v.y * 0.5 + 0.5) * rect.height,
+    };
+  }
+
+  /** 每帧把手柄贴到石板边缘中点；拖动时跟手，松手后弹簧落位 */
+  private updateHandles(dt: number): void {
+    if (!this.handles) return;
+    const y = -0.33; // 石板侧面中点高度
+    const r = this.resizeDrag;
+    for (const side of ['left', 'right'] as const) {
+      const sign = side === 'left' ? -1 : 1;
+      // 网格边缘（18px 淡入判定的基准）
+      this.edgeScreen[side] = this.projectWorld(sign * this.halfW, y, 0);
+      // 手柄中心挂在石板边缘（网格外 0.9 格），命中区不侵入网格
+      const back = this.projectWorld(sign * (this.halfW + HANDLE_EDGE_PAD), y, 0);
+      const spring = this.handleSpring[side];
+      if (r && r.side === side) {
+        // 拖动中手柄跟"想要"的宽度走（连续），棋盘按 4 列吸附（离散）
+        const raw = clamp(r.rawHalfW, WINDOW_COLS_MIN / 2, WINDOW_COLS_MAX / 2 + 2);
+        const finger = this.projectWorld(sign * (raw + HANDLE_EDGE_PAD), y, 0);
+        spring.snap(finger.x - back.x);
+      } else {
+        spring.update(dt);
+      }
+      const x = back.x + spring.value;
+      this.handleScreen[side] = { x, y: back.y };
+      this.handles[side].style.transform = `translate3d(${x}px, ${back.y}px, 0) translate(-50%, -50%)`;
+    }
   }
 
   // ---------------------------------------------------------------- hover / play
@@ -1039,7 +1440,7 @@ export class Studio {
 
   setPlayhead(pos: number): void {
     this.playheadPos = pos;
-    this.playhead.position.x = X0 + pos;
+    this.playhead.position.x = pos;
     if (this.playheadShown) this.playhead.visible = this.playheadInWindow();
   }
 
@@ -1097,19 +1498,29 @@ export class Studio {
     if (notify) this.onViewChange?.(id);
   }
 
-  /** 按当前机位/窗口比例求刚好装下舞台的距离 */
-  private fitView(): void {
+  /**
+   * 按当前机位/窗口比例求刚好装下舞台的距离。
+   * apply=false（自由状态）只更新缩放范围，不抢用户机位。
+   */
+  private fitView(apply = true): void {
     const dist = fitDistance({
       az: this.cam.taz,
       el: this.cam.tel,
       fov: this.cam.tfov,
       aspect: this.camera.aspect,
       lookY: this.cam.tlookY,
-      halfW: STAGE_HALF_W,
+      halfW: this.halfW + STAGE_HALF_W_PAD,
       halfD: STAGE_HALF_D,
       topY: STAGE_TOP_Y,
     });
-    this.cam.tdist = dist;
+    if (this.viewId === 'free') {
+      // 自由状态保留用户放大的范围，只保证新宽度也装得下
+      this.zoomMin = Math.min(16, dist * 0.62);
+      this.zoomMax = Math.max(72, dist * 1.55);
+      this.cam.tdist = clamp(this.cam.tdist, this.zoomMin, this.zoomMax);
+      return;
+    }
+    if (apply) this.cam.tdist = dist;
     this.zoomMin = dist * 0.62;
     this.zoomMax = dist * 1.55;
   }
@@ -1129,6 +1540,8 @@ export class Studio {
     const rect = this.canvas.getBoundingClientRect();
     this.cam.tpx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     this.cam.tpy = ((e.clientY - rect.top) / rect.height) * 2 - 1;
+    // 指针靠近网格左右边缘 18px → 该侧手柄淡入
+    this.pointerNearEdge(e);
   }
 
   resize(): void {
@@ -1188,7 +1601,7 @@ export class Studio {
     if (this.wipe.active) {
       this.wipe.t += dt;
       const progress = clamp(this.wipe.t / this.wipe.dur, 0, 1);
-      this.wipeBand.position.x = X0 - 0.8 + (WINDOW + 1.6) * progress;
+      this.wipeBand.position.x = -this.halfW - 0.8 + (this.windowColsValue + 1.6) * progress;
       this.setWipeOpacity(Math.sin(Math.PI * progress));
       this.flushDieQueue(this.wipe.t);
       if (progress >= 1) {
@@ -1262,6 +1675,8 @@ export class Studio {
     if (this.outline.visible) {
       (this.outline.material as THREE.LineBasicMaterial).opacity = this.drag ? 0.35 : 0.9;
     }
+
+    this.updateHandles(dt);
   }
 
   render(): void {

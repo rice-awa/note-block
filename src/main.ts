@@ -6,7 +6,7 @@ import { ExamplePanel } from './example-panel';
 import { EXAMPLES, type Example } from './examples';
 import { Hud } from './hud';
 import { clampWindowCols, loadPrefs, savePrefs, type Prefs } from './prefs';
-import { COLS, DEMO, MAX_MIDI, MIN_MIDI, ROWS } from './rows';
+import { DEMO, MAX_MIDI, MIN_MIDI, ROWS } from './rows';
 import { Studio, type BlockView, type Cell, type PaintCell } from './scene';
 import {
   clampBars,
@@ -29,7 +29,8 @@ import {
 } from './song';
 
 const MEASURE = 16;
-const WINDOW = COLS;
+/** 可见列数随边缘拖拽 / 配置面板变化，窗口跟随全部按它算 */
+const windowCols = (): number => studio.windowCols;
 
 const canvas = document.querySelector<HTMLCanvasElement>('#scene')!;
 const studio = new Studio(canvas);
@@ -102,7 +103,7 @@ function syncLength(): void {
   if (infinite) bars = Math.min(MAX_BARS, Math.max(bars, content));
   const length = (infinite ? Math.max(bars, content) : bars) * MEASURE;
   clock.setLength(Math.min(MAX_BARS * MEASURE, length));
-  studio.setScrollable(clock.length > WINDOW);
+  studio.setScrollable(clock.length > windowCols());
   hud.setLength(clock.length);
   hud.setEmpty(studio.blockCount === 0);
   syncPanel();
@@ -146,7 +147,7 @@ function applyState(next: SongStateInput, animate = false): void {
   syncLength();
   clock.seek(Math.min(clock.position, clock.length - 1));
   viewOffset = 0;
-  if (studio.canScroll) studio.setWindow(Math.max(0, clock.position - WINDOW * 0.7), true);
+  if (studio.canScroll) studio.setWindow(Math.max(0, clock.position - windowCols() * 0.7), true);
   else studio.setWindow(0, true);
   hud.setPlaying(false);
   hud.setAtEnd(false);
@@ -190,7 +191,7 @@ function toggleInfinite(): void {
   syncLength();
   viewOffset = 0;
   if (studio.canScroll) {
-    if (infinite) studio.setWindow(Math.max(0, clock.position - WINDOW * 0.7), true);
+    if (infinite) studio.setWindow(Math.max(0, clock.position - windowCols() * 0.7), true);
     else studio.setWindow(0, true);
   }
   clock.seek(Math.min(clock.position, clock.length - 1));
@@ -262,13 +263,36 @@ function setReverb(value: number): void {
   syncPanel();
 }
 
-/** 窗口列数：M4 才真正重建舞台，这里先持久化并 feature-detect 调用 */
+/** 窗口列数：配置面板 stepper 与边缘手柄共用；偏好单独存档，不进撤销栈 */
 function setWindowCols(value: number): void {
   prefs.windowCols = clampWindowCols(value);
   savePrefs(prefs);
-  const target = studio as unknown as { setWindowCols?: (cols: number) => void };
-  if (typeof target.setWindowCols === 'function') target.setWindowCols(prefs.windowCols);
+  studio.setWindowCols(prefs.windowCols);
+  // 宽度变了，"一屏是否装得下"也跟着变
+  syncLength();
   syncPanel();
+}
+
+/** 上一次 tick 的列数：每跨过一小节（4 列）敲一声 */
+let dragTickCols = 0;
+
+/** 边缘拖拽回调：偏好随手更新，松手时落定并重算曲长 / 滚动能力 */
+function applyDraggedCols(cols: number, phase: 'start' | 'move' | 'end'): void {
+  const snapped = clampWindowCols(cols);
+  if (phase === 'start') {
+    hud.dismissHint();
+    dragTickCols = snapped;
+  } else if (phase === 'move' && snapped !== dragTickCols) {
+    // 每跨过一小节一声极轻的 tick，方向决定音高
+    const up = snapped > dragTickCols;
+    dragTickCols = snapped;
+    audio.sfx('sfx_click', 0, up ? 1.14 : 0.98, 0.06);
+  }
+  prefs.windowCols = snapped;
+  savePrefs(prefs);
+  syncLength();
+  syncPanel();
+  if (phase === 'end') audio.sfx('sfx_click', 0, 1.04, 0.09);
 }
 
 function clearAll(): void {
@@ -294,7 +318,7 @@ function seekTo(step: number): void {
   const target = Math.max(0, Math.min(MAX_STEPS - 1, Math.round(step)));
   clock.seek(target);
   viewOffset = 0;
-  if (studio.canScroll) studio.setWindow(Math.max(0, target - WINDOW * 0.7), true);
+  if (studio.canScroll) studio.setWindow(Math.max(0, target - windowCols() * 0.7), true);
   hud.setStep(clock.playing ? Math.floor(clock.position) % MEASURE : -1);
   hud.setProgress(clock.position, clock.length);
 }
@@ -393,6 +417,7 @@ hud.onView = (id) => {
   studio.setView(id);
   audio.sfx('sfx_click', 0, id === 'persp' ? 1 : id === 'top' ? 1.12 : 1.26, 0.16);
 };
+studio.onResize = applyDraggedCols;
 hud.onInfinite = toggleInfinite;
 hud.onClear = clearAll;
 hud.onShare = () => void share();
@@ -524,6 +549,8 @@ studio.setInfinite(infinite);
 clock.setLoop(loop);
 clock.setBpm(initial.bpm);
 hud.setBpm(clock.bpm);
+// 先按偏好定宽（会重建舞台），再装配曲子
+studio.setWindowCols(prefs.windowCols);
 studio.setSong(initial.notes, true);
 syncLength();
 studio.setWindow(0, true);
@@ -533,7 +560,6 @@ hud.setView(studio.view);
 hud.setStep(-1);
 hud.setProgress(0, clock.length);
 if (savedState) lastSavedAt = Date.now();
-setWindowCols(prefs.windowCols);
 updateSavedLabel();
 if (sharedState) {
   // 分享链接只负责"第一次打开"，之后编辑走本地存档，避免刷新又回到旧分享
@@ -792,7 +818,7 @@ function armEdgeScroll(): void {
     disarmEdge();
     return;
   }
-  const lastCol = Math.floor(studio.windowTarget + WINDOW - 1);
+  const lastCol = Math.floor(studio.windowTarget + windowCols() - 1);
   if (s.lastStep < lastCol - 1) {
     disarmEdge();
     return;
@@ -806,7 +832,7 @@ function armEdgeScroll(): void {
     if (!p || p.mode !== 'paint' || !studio.canScroll) return;
     // 有限长曲只在曲长内翻页；无限模式画到哪长到哪，上限仍是 32 小节
     const limit = infinite ? MAX_STEPS : clock.length;
-    if (studio.windowTarget + WINDOW >= limit) {
+    if (studio.windowTarget + windowCols() >= limit) {
       disarmEdge();
       return;
     }
@@ -829,6 +855,8 @@ function pinchFromTouches(): { cx: number; cy: number; dist: number } | null {
 
 canvas.addEventListener('pointerdown', (e) => {
   if (drawer.isOpen) return;
+  // 边缘手柄拖拽优先于方块拾取 / 绘制
+  if (studio.isResizing) return;
   void unlock();
   if (e.pointerType === 'touch') {
     touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -848,6 +876,11 @@ canvas.addEventListener('pointerdown', (e) => {
     return;
   }
   if (e.button !== 0) return;
+  const resizeSide = studio.hitResizeHandle(e);
+  if (resizeSide) {
+    studio.startResize(resizeSide, e);
+    return;
+  }
   hud.dismissHint();
 
   const block = studio.pickBlock(e);
@@ -873,6 +906,8 @@ canvas.addEventListener('pointerdown', (e) => {
 });
 
 canvas.addEventListener('pointermove', (e) => {
+  // 边缘拖拽中：手势归 Studio 的 window 监听，画布不再 hover / 绘制
+  if (studio.isResizing) return;
   if (e.pointerType === 'touch' && touchPoints.has(e.pointerId)) {
     touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pinch && touchPoints.size >= 2) {
@@ -914,7 +949,7 @@ function commitDrag(): { removed: boolean; drop: Cell | null } {
   audio.sfx(removed ? 'sfx_break' : 'sfx_place', 0, removed ? 0.95 : 0.85, removed ? 0.5 : 0.28);
   canvas.style.cursor = 'default';
   // 拖到窗口最右一列：松手后让出 4 列，像翻页
-  if (studio.canScroll && !removed && drop && drop.step >= studio.windowStart + WINDOW - 1) {
+  if (studio.canScroll && !removed && drop && drop.step >= studio.windowStart + windowCols() - 1) {
     studio.setWindow(studio.windowTarget + 4);
   }
   syncLength();
@@ -927,6 +962,7 @@ function endPointer(e: PointerEvent): void {
     touchPoints.delete(e.pointerId);
     if (touchPoints.size < 2) pinch = null;
   }
+  if (studio.isResizing) return;
   if (stroke) finishStroke();
   if (studio.isDragging) commitDrag();
   if (orbit) {
@@ -939,6 +975,7 @@ function endPointer(e: PointerEvent): void {
 canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
 canvas.addEventListener('pointerleave', () => {
+  studio.pointerNearEdge(null);
   if (!studio.isDragging && !stroke) {
     studio.setHover(null);
     hoverBlock = null;
@@ -1030,6 +1067,11 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.key === 'Escape') {
+    if (studio.isResizing) {
+      e.preventDefault();
+      studio.cancelResize();
+      return;
+    }
     if (drawer.isOpen) {
       e.preventDefault();
       drawer.hide();
@@ -1086,13 +1128,13 @@ function frame(now: number): void {
   hud.setMeasure(Math.floor(pos / MEASURE), Math.max(1, clock.length / MEASURE));
   hud.setProgress(pos, clock.length);
 
-  if (studio.canScroll && !studio.isDragging) {
+  if (studio.canScroll && !studio.isDragging && !studio.isResizing) {
     if (prevPos - pos > 1) {
       // 循环回卷：窗口直接归位，不做倒带长滑
       viewOffset = 0;
-      studio.setWindow(Math.max(0, pos - WINDOW * 0.7), true);
+      studio.setWindow(Math.max(0, pos - windowCols() * 0.7), true);
     } else if (clock.playing) {
-      studio.setWindow(Math.max(0, pos - WINDOW * 0.7 + viewOffset));
+      studio.setWindow(Math.max(0, pos - windowCols() * 0.7 + viewOffset));
     }
   }
   prevPos = pos;

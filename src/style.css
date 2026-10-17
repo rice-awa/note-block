@@ -788,6 +788,104 @@ body.is-playing .play .ico-pause {
   white-space: nowrap;
 }
 
+/* ---------------------------------------------------------------- 棋盘边缘手柄 */
+
+/*
+ * 左右各一枚圆角竖条手柄，挂在石板边缘中点（每帧把世界坐标投到屏幕）。
+ * 命中区比可见竖条宽：桌面 26px、触屏 44px，保证不侵入网格格内。
+ */
+.edge-handle {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 128px;
+  transform: translate3d(-999px, -999px, 0) translate(-50%, -50%);
+  touch-action: none;
+  cursor: ew-resize;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.edge-handle-bar {
+  width: 5px;
+  height: 68px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(58, 48, 34, 0.28) 0%, rgba(58, 48, 34, 0.52) 50%, rgba(58, 48, 34, 0.28) 100%);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.75),
+    0 6px 16px rgba(74, 57, 28, 0.16);
+  opacity: 0;
+  transform: scale(1);
+  transition:
+    opacity 180ms ease,
+    transform 200ms cubic-bezier(0.23, 1, 0.32, 1);
+  pointer-events: none;
+}
+
+.edge-handle.is-visible .edge-handle-bar {
+  opacity: 0.9;
+}
+
+.edge-handle.is-dragging .edge-handle-bar {
+  transform: scale(1.06);
+  background: linear-gradient(180deg, rgba(192, 57, 43, 0.5) 0%, rgba(192, 57, 43, 0.82) 50%, rgba(192, 57, 43, 0.5) 100%);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .edge-handle:hover .edge-handle-bar {
+    opacity: 0.9;
+  }
+}
+
+/* 触屏：44px 命中区（ROADMAP §6.5） */
+@media (pointer: coarse) {
+  .edge-handle {
+    width: 44px;
+    height: 160px;
+  }
+
+  .edge-handle-bar {
+    width: 6px;
+    height: 76px;
+  }
+}
+
+/* 拖拽中的玻璃小胶囊：N 小节 · N 列 */
+.resize-capsule {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 7;
+  padding: 6px 11px;
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  background: var(--glass);
+  box-shadow:
+    0 10px 26px rgba(74, 57, 28, 0.14),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate3d(0, 0, 0);
+  transition: opacity 140ms ease;
+}
+
+.resize-capsule.is-visible {
+  opacity: 1;
+}
+
 /* ---------------------------------------------------------------- 设置抽屉 */
 
 .drawer-scrim {
