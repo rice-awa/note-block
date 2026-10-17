@@ -15,6 +15,10 @@
 | --- | --- |
 | ![front](docs/show-front.png) | ![mobile](docs/show-mobile.png) |
 
+| 设置 · 曲长 / 循环 / 音量 | 示例 · 五套编配 | 拖边缘 · 8–32 列 |
+| --- | --- | --- |
+| ![config](docs/show-config.png) | ![examples](docs/show-examples.png) | ![wide](docs/show-wide.png) |
+
 ## 运行
 
 ```bash
