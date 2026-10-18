@@ -1627,12 +1627,12 @@ export class Studio {
     const limitX = this.halfW + 8;
     const limitZ = STAGE_HALF_D + 4;
     this.cam.tpanX = clamp(
-      this.cam.tpanX - rightX * dx * k + (upX * dy * k) / sinEl,
+      this.cam.tpanX - rightX * dx * k - (upX * dy * k) / sinEl,
       -limitX,
       limitX,
     );
     this.cam.tpanZ = clamp(
-      this.cam.tpanZ - rightZ * dx * k + (upZ * dy * k) / sinEl,
+      this.cam.tpanZ - rightZ * dx * k - (upZ * dy * k) / sinEl,
       -limitZ,
       limitZ,
     );
