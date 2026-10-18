@@ -13,7 +13,7 @@ npm run preview  # 预览构建产物 http://127.0.0.1:5192
 
 - **没有测试框架、lint 或格式化脚本**。不要臆造 `npm test`。验证方式是 `npm run build` 加浏览器实测。
 - 浏览器 QA 使用 Playwright CLI（项目根目录有 `.playwright-cli/` 日志）；验收脚本与截图放在 `.scratch/`。两者都在 `.gitignore` 中。用完关闭浏览器，失败路径也要关闭，别留下 headless Chromium。
-- `src/main.ts` 暴露了调试钩子：`window.__nb`（capture/applyState/undo/redo/选择/存档/示例等）、`__studio`、`__clock`、`__audio`、`__hud`、`__gestures`、`__viewport`、`__notePanel`。脚本化验收优先用它们断言状态，不要只截图看表面。
+- `src/main.ts` 暴露了调试钩子：`window.__nb`（capture/applyState/undo/redo/选择/存档/示例，以及 `mode`/`stageRect`/`prefs`/`infinite`/`bars`/`loop` 等只读状态）、`__studio`、`__clock`、`__audio`、`__hud`、`__config`、`__drawer`、`__examplesDrawer`、`__helpDrawer`、`__examples`、`__gestures`、`__viewport`、`__notePanel`。脚本化验收优先用它们断言状态，不要只截图看表面。
 - 没有 `vite.config.ts`；`index.html` 是 Vite 入口，`public/` 按根路径提供。
 
 ## 架构
@@ -25,7 +25,7 @@ npm run preview  # 预览构建产物 http://127.0.0.1:5192
 `src/main.ts` 是唯一的接线层与事务边界：
 
 - 权威状态分散在服务里：音符在 `Studio`，`bpm`/播放位置在 `Clock`，`infinite` / `bars` / `loop` / 选中项在 `main.ts` 的模块变量里。`capture()` 把它们合成 `SongState` 快照。
-- 构造顺序：`Studio`、`AudioEngine`/`Clock`、`Hud`、`History`、`SaveCoordinator`，再是各抽屉/面板、`GestureController`、`ViewportWatcher`。
+- 构造顺序：`Studio`、`AudioEngine`、`Hud`、`History`、`SaveCoordinator` → `Clock` → `ConfigPanel`、三只抽屉（设置/示例/玩法）、`NotePanel` → `ViewportWatcher` → `GestureController`。
 - 一次编辑的典型链路：手势 → `Studio` 变更 + `main.ts` 记录事务前快照 → `syncLength()`（由内容/曲长推导时钟长度、`stepLimit`、能否滚动）→ `markDirty()`（防抖写存档）→ HUD/面板同步。
 - 撤销/重做、载入示例、恢复备份都走 `applyState()`：整首替换并重新校准时钟、窗口、播放位置与选择。不要为这些操作用第二套状态通道。
 
@@ -35,7 +35,7 @@ npm run preview  # 预览构建产物 http://127.0.0.1:5192
 - `History` 是快照式（40 条上限 + 总音符预算），连续手势一笔一条；滚轮调音按约 900ms 合并。选择、相机、面板开关、偏好**不得**进入撤销栈。
 - 分享码 `#s=` 有三代格式（v1/v2/v3），解码必须继续兼容旧链接。改动 `SongState` 时必须同时处理 `normalizeState()` 和编解码兼容；不要重命名 `midi` 字段。
 - 存储键固定为：曲谱 `note-block:v1`、偏好 `note-block:prefs:v1`、示例/清空前备份 `note-block:backup:v1`。
-- `src/persistence.ts` 的 `SaveCoordinator` 负责 500ms 防抖、revision 防旧结果覆盖、保存状态（local/dirty/saving/saved/failed）。只有真正写入成功才更新“已保存”时间；失败必须显示“未保存到本机”。不要绕过它直接调用 `saveLocal`（启动时读存档、备份写入除外）。
+- `src/persistence.ts` 的 `SaveCoordinator` 负责 500ms 防抖、revision 防旧结果覆盖、保存状态（local/dirty/saving/saved/failed）。只有真正写入成功才更新“已保存”时间；失败必须显示“未保存到本机”。不要绕过它直接调用 `saveLocal`（启动时读存档、备份写入除外）。切后台、`pagehide`、`beforeunload` 会先 `gestures.cancelAll()` 再 `flush()`，半拖动/半清空不得落盘。
 - `src/prefs.ts` 的音量、混响、可见列数、玩法提示状态属于本机偏好，不进分享、不进撤销。
 
 ### 渲染与坐标模型（最容易改错的部分）
@@ -65,8 +65,8 @@ npm run preview  # 预览构建产物 http://127.0.0.1:5192
 
 ### UI 模块
 
-- `hud.ts`：顶栏、播放栏、进度条、音色行、撤销/重做、保存状态、toast 与抽屉内反馈槽。
-- `drawer.ts`：通用玻璃抽屉（开合、焦点圈定、Esc、窄屏遮罩），`config-panel.ts` / `example-panel.ts` / 帮助抽屉只填内容。
+- `hud.ts`：顶栏（含窄屏「更多 / 视角」菜单）、播放栏、进度条、音色行、撤销/重做、保存状态、空舞台提示、toast 与抽屉内反馈槽。
+- `drawer.ts`：通用玻璃抽屉（开合、焦点圈定、Esc、窄屏遮罩）；`config-panel.ts` / `example-panel.ts` 分别填设置与示例内容，玩法抽屉的内容静态写在 `index.html`。
 - `note-panel.ts` + `note-label.ts`：选中音符的编辑条与音高/位置格式化（区分“相对半音索引”和绝对音名）。
 - `examples.ts` / `rows.ts`：内置示例编配、8 行音色定义与 demo 音符。
 - `motion.ts`：自写弹簧（response/damping 口径）、阻尼、动量投影。物理交互用弹簧，一次性 UI 用 CSS 曲线；具体参数与设计规则见 `DESIGN.md`。
