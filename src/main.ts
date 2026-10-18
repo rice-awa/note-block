@@ -1400,8 +1400,23 @@ function isTextEntry(el: HTMLElement | null): boolean {
   return el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.tagName === 'INPUT';
 }
 
-function isStageFocus(el: HTMLElement | null): boolean {
-  return !el || el === document.body || el === document.documentElement || el === canvas;
+// 空格要能在按钮 / 开关上覆盖原生激活，只把「真正在输入文字」的控件放行
+function isTypingTarget(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  if (el.tagName === 'TEXTAREA') return true;
+  if (el.tagName === 'INPUT') {
+    const type = (el as HTMLInputElement).type;
+    return (
+      type !== 'checkbox' &&
+      type !== 'radio' &&
+      type !== 'range' &&
+      type !== 'button' &&
+      type !== 'submit' &&
+      type !== 'reset'
+    );
+  }
+  return false;
 }
 
 function anyDrawerOpen(): boolean {
@@ -1445,16 +1460,16 @@ window.addEventListener('keydown', (e) => {
     return;
   }
 
-  // 抽屉打开时，页面快捷键不得修改背后的舞台
-  if (anyDrawerOpen()) return;
-
-  // 空格只服务舞台 / 页面背景；按钮、开关、输入保留原生语义
+  // 空格只控制播放：按钮、开关上的原生空格激活被覆盖，文字输入除外
   if (e.code === 'Space') {
-    if (!isStageFocus(el) || isTextEntry(el)) return;
+    if (isTypingTarget(el)) return;
     e.preventDefault();
     if (!e.repeat) togglePlay();
     return;
   }
+
+  // 抽屉打开时，其余页面快捷键不得修改背后的舞台
+  if (anyDrawerOpen()) return;
 
   if (isTextEntry(el)) return;
   const mod = e.metaKey || e.ctrlKey;
@@ -1512,6 +1527,13 @@ window.addEventListener('keydown', (e) => {
       markDirty();
     }
   }
+});
+
+// 按钮 / 开关的空格激活发生在 keyup，keydown 的 preventDefault 拦不住
+window.addEventListener('keyup', (e) => {
+  if (e.code !== 'Space') return;
+  if (isTypingTarget(e.target as HTMLElement | null)) return;
+  e.preventDefault();
 });
 
 // 中键拖拽：压掉浏览器自带的自动滚动 / 粘贴行为
