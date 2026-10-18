@@ -179,6 +179,17 @@ body.ready #veil {
   height: 20px;
 }
 
+.repo-link {
+  width: auto;
+  padding: 0 12px;
+  border-radius: 999px;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
 .icon-btn .ico-off,
 .icon-btn.is-muted .ico-on {
   display: none;
@@ -1700,7 +1711,8 @@ body.is-playing .play .ico-pause {
   right: max(26px, env(safe-area-inset-right));
 }
 
-.popover button {
+.popover button,
+.popover a {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1715,6 +1727,7 @@ body.is-playing .play .ico-pause {
   font-weight: 520;
   letter-spacing: 0.02em;
   text-align: left;
+  text-decoration: none;
   cursor: pointer;
 }
 
@@ -1734,7 +1747,8 @@ body.is-playing .play .ico-pause {
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .popover button:not(:disabled):not([aria-checked='true']):not([aria-pressed='true']):hover {
+  .popover button:not(:disabled):not([aria-checked='true']):not([aria-pressed='true']):hover,
+  .popover a:hover {
     background: rgba(32, 30, 26, 0.06);
   }
 }
@@ -2253,6 +2267,8 @@ body[data-mode='portrait'] #examples,
 body[data-mode='landscape'] #examples,
 body[data-mode='portrait'] #help,
 body[data-mode='landscape'] #help,
+body[data-mode='portrait'] #github,
+body[data-mode='landscape'] #github,
 body[data-mode='portrait'] #fit-stage,
 body[data-mode='landscape'] #fit-stage {
   display: none;
@@ -2515,7 +2531,8 @@ body[data-mode='landscape'] .readout {
     display: none;
   }
 
-  .popover button {
+  .popover button,
+  .popover a {
     min-height: 44px;
   }
 

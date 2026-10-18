@@ -278,6 +278,9 @@ export class Hud {
   // ---------------------------------------------------------------- 弹出菜单
 
   private bindMenus(): void {
+    this.moreMenu.querySelectorAll<HTMLAnchorElement>('a').forEach((link) => {
+      link.addEventListener('click', () => this.closeMenus(true));
+    });
     this.viewMenuBtn.addEventListener('click', () => this.toggleMenu(this.viewMenu, this.viewMenuBtn));
     this.moreBtn.addEventListener('click', () => this.toggleMenu(this.moreMenu, this.moreBtn));
     this.viewFit.addEventListener('click', () => {
