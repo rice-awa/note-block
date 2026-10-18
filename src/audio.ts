@@ -1,4 +1,5 @@
 import { BASE_MIDI } from './rows';
+import { MAX_STEPS } from './song';
 
 type Voice = { gain: number; sample: string };
 
@@ -401,9 +402,9 @@ export class Clock {
     }
   }
 
-  /** 改循环长度：clamp 到 16..512 的整数；播放中重锚，越界的 basePos 夹回新长度内 */
+  /** 改循环长度：clamp 到 16..MAX_STEPS 的整数；播放中重锚，越界的 basePos 夹回新长度内 */
   setLength(length: number): void {
-    const clamped = Math.max(16, Math.min(512, Math.round(length)));
+    const clamped = Math.max(16, Math.min(MAX_STEPS, Math.round(length)));
     if (clamped === this.length) return;
     if (this.playing) {
       // 先用旧长度取位置，再换 length（同 setBpm 的顺序）

@@ -203,18 +203,26 @@
         </div>
         <div id="steps" class="steps" aria-hidden="true"></div>
       </div>
-      <div
-        class="rail"
-        id="rail"
-        role="slider"
-        tabindex="0"
-        aria-label="播放位置"
-        aria-valuemin="0"
-        aria-valuemax="16"
-        aria-valuenow="0"
-      >
-        <div class="rail-track"><div class="rail-fill" id="railFill"></div></div>
-        <div class="rail-thumb" id="railThumb"></div>
+      <div class="rail-row">
+        <span id="railNow" class="rail-time">0:00.0</span>
+        <div
+          class="rail"
+          id="rail"
+          role="slider"
+          aria-orientation="horizontal"
+          tabindex="0"
+          aria-label="播放位置"
+          aria-valuemin="0"
+          aria-valuemax="15"
+          aria-valuenow="0"
+          aria-valuetext="M01 · 0:00.0 / 0:00.0"
+        >
+          <div id="railTicks" class="rail-ticks" aria-hidden="true"></div>
+          <div class="rail-track"><div class="rail-fill" id="railFill"></div></div>
+          <div class="rail-thumb" id="railThumb"></div>
+          <div id="railTip" class="rail-tip" hidden></div>
+        </div>
+        <span id="railEnd" class="rail-time rail-time--end">0:00.0</span>
       </div>
     </footer>
 

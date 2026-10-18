@@ -4,7 +4,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { clamp, damp, projectMomentum, Spring, tiltFromVelocity } from './motion';
 import { clampWindowCols, WINDOW_COLS_MAX, WINDOW_COLS_MIN, WINDOW_COLS_STEP } from './prefs';
 import { BASE_MIDI, COLS, MAX_MIDI, MIN_MIDI, ROWS, ROW_COUNT } from './rows';
-import { MAX_STEPS, type Note } from './song';
+import { MAX_STEPS, MAX_STEPS_FINITE, type Note } from './song';
 import { fitDistance, VIEW_ORDER, VIEWS, type ViewId } from './views';
 
 const CELL = 1;
@@ -107,6 +107,11 @@ export class Studio {
     py: 0,
     tpx: 0,
     tpy: 0,
+    /** 中键平移：地面平面内的目标/当前偏移 */
+    panX: 0,
+    panZ: 0,
+    tpanX: 0,
+    tpanZ: 0,
   };
   private readonly lookAt = new THREE.Vector3(0, -1.25, 0);
   private viewId: ViewId = 'persp';
@@ -123,10 +128,18 @@ export class Studio {
   private viewStart = 0;
   private viewStartTarget = 0;
   private infinite = false;
+  /** 坐标上限：有限模式为曲长，无限模式为工程安全边界 */
+  private stepLimit = MAX_STEPS_FINITE;
+  /** 窗口能滑到的最远步数（避免滑进大片空白） */
+  private windowLimit = MAX_STEPS_FINITE;
   /** 曲长超过一屏：有限长曲与无限模式都要能横向滑动窗口 */
   private scrollable = false;
   private playheadPos = 0;
   private playheadShown = false;
+  private maxStepValue = -1;
+  private maxStepDirty = false;
+  /** 当前窗口内可见的方块（每帧重收，渲染循环只遍历它） */
+  private visibleBlocks: BlockView[] = [];
   private readonly textures = new Map<string, THREE.Texture>();
   private readonly floorTextures = new Map<string, THREE.Texture>();
   private readonly maxAniso: number;
@@ -650,6 +663,7 @@ export class Studio {
     const mesh = new THREE.Mesh(geom, mat);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
+    mesh.visible = this.inWindow(step);
 
     const x = cellX(step);
     const z = cellZ(row);
@@ -677,6 +691,10 @@ export class Studio {
     this.blockGroup.add(mesh);
     this.blocks.set(this.key(step, row), block);
     this.indexBlock(block);
+    if (step > this.maxStepValue) {
+      this.maxStepValue = step;
+      this.maxStepDirty = false;
+    }
 
     if (pop) {
       block.ss.setTarget(1);
@@ -720,6 +738,7 @@ export class Studio {
     if (!block) return;
     this.blocks.delete(key);
     this.unindexBlock(block);
+    if (step >= this.maxStepValue) this.maxStepDirty = true;
     this.blockGroup.remove(block.mesh);
     const pos = block.mesh.position;
     if (burst > 0) {
@@ -738,6 +757,8 @@ export class Studio {
     }
     this.blocks.clear();
     this.stepIndex.clear();
+    this.maxStepValue = -1;
+    this.maxStepDirty = false;
     this.dieQueue.length = 0;
     this.wipe.active = false;
     if (this.wipeBand) this.wipeBand.visible = false;
@@ -751,9 +772,14 @@ export class Studio {
   }
 
   get maxStep(): number {
-    let max = -1;
-    for (const b of this.blocks.values()) if (b.step > max) max = b.step;
-    return max;
+    if (this.maxStepDirty) {
+      this.maxStepValue = -1;
+      for (const step of this.stepIndex.keys()) {
+        if (step > this.maxStepValue) this.maxStepValue = step;
+      }
+      this.maxStepDirty = false;
+    }
+    return this.maxStepValue;
   }
 
   get blockCount(): number {
@@ -775,10 +801,25 @@ export class Studio {
 
   setInfinite(on: boolean): void {
     this.infinite = on;
+    this.stepLimit = on ? MAX_STEPS : MAX_STEPS_FINITE;
   }
 
   get isInfinite(): boolean {
     return this.infinite;
+  }
+
+  /** 当前模式允许到达的步号上限（不影响已载入但超出曲长的音符） */
+  setStepLimit(limit: number): void {
+    this.stepLimit = Math.max(1, Math.min(MAX_STEPS, Math.round(limit)));
+  }
+
+  get stepLimitValue(): number {
+    return this.stepLimit;
+  }
+
+  /** 窗口能滑到的最远步数：由 main 按曲长 / 无限模式传入 */
+  setWindowLimit(limit: number): void {
+    this.windowLimit = Math.max(1, Math.min(MAX_STEPS, Math.round(limit)));
   }
 
   /** 曲长超过一屏才允许窗口滚动；关掉时立即回到第一屏 */
@@ -802,7 +843,7 @@ export class Studio {
 
   /** 目标窗口左缘（步）。snap=true 用于 seek / 模式切换，普通跟随走阻尼 */
   setWindow(target: number, snap = false): void {
-    const maxStart = Math.max(0, MAX_STEPS - this.windowColsValue);
+    const maxStart = Math.max(0, Math.min(this.stepLimit, this.windowLimit) - this.windowColsValue);
     this.viewStartTarget = clamp(target, 0, maxStart);
     if (!this.scrollable) {
       this.viewStart = 0;
@@ -956,7 +997,7 @@ export class Studio {
     const localX = p.x + this.halfW + viewStart;
     const step = stepFromX(localX);
     const row = rowFromZ(p.z);
-    if (step < 0 || step >= MAX_STEPS || row < 0 || row >= ROW_COUNT) return null;
+    if (step < 0 || step >= this.stepLimit || row < 0 || row >= ROW_COUNT) return null;
     // 舞台内坐标 stageX = worldX + W/2 ∈ [-0.5, W + 0.5]，与 viewStart 无关
     const stageX = p.x + this.halfW;
     if (stageX < -0.5 || stageX > this.windowColsValue + 0.5) return null;
@@ -981,7 +1022,7 @@ export class Studio {
     const localX = p.x + this.halfW + viewStart;
     const step = stepFromXFloor(localX);
     const row = Math.floor(p.z - Z0);
-    if (step < 0 || step >= MAX_STEPS || row < 0 || row >= ROW_COUNT) return null;
+    if (step < 0 || step >= this.stepLimit || row < 0 || row >= ROW_COUNT) return null;
     const stageX = p.x + this.halfW;
     if (stageX < -0.5 || stageX > this.windowColsValue + 0.5) return null;
     const first = Math.floor(viewStart);
@@ -1084,7 +1125,7 @@ export class Studio {
       return { removed: true };
     }
 
-    const step = clamp(rawStep, 0, MAX_STEPS - 1);
+    const step = clamp(rawStep, 0, this.stepLimit - 1);
     const row = clamp(rawRow, 0, ROW_COUNT - 1);
     const other = this.blockAt(step, row);
     const sameCell = step === b.step && row === b.row;
@@ -1116,6 +1157,12 @@ export class Studio {
       b.row = row;
       this.blocks.set(this.key(step, row), b);
       this.reindexBlock(b, oldStep);
+      if (step > this.maxStepValue) {
+        this.maxStepValue = step;
+        this.maxStepDirty = false;
+      } else if (oldStep >= this.maxStepValue) {
+        this.maxStepDirty = true;
+      }
     }
     b.sx.setTarget(cellX(step), vx);
     b.sz.setTarget(cellZ(row), vz);
@@ -1197,7 +1244,7 @@ export class Studio {
     this.windowColsValue = next;
     this.resizeStage();
     this.updateShadowCamera();
-    // 窗口变宽后原来的滚动位可能越界：夹回 [0, MAX_STEPS - W]
+    // 窗口变宽后原来的滚动位可能越界：夹回 [0, min(stepLimit, windowLimit) - W]
     this.setWindow(this.viewStartTarget, true);
     this.fitView(this.viewId !== 'free');
     if (phase) this.onResize?.(next, phase);
@@ -1335,7 +1382,7 @@ export class Studio {
     // 撞到 8/32 后继续拖：宽度不再变，退化为窗口平移（夹在 0 / 最大滚动位）
     const overflow = raw - bounded;
     const pan = r.side === 'right' ? overflow : -overflow;
-    const maxStart = Math.max(0, MAX_STEPS - next);
+    const maxStart = Math.max(0, Math.min(this.stepLimit, this.windowLimit) - next);
     const targetView = clamp(r.startView + pan, 0, maxStart);
     if (next !== this.windowColsValue) this.applyWindowCols(next, 'move');
     if (this.scrollable && Math.abs(targetView - this.viewStartTarget) > 1e-6) this.setWindow(targetView, true);
@@ -1518,6 +1565,10 @@ export class Studio {
   private applyPreset(id: Exclude<ViewId, 'free'>, notify: boolean): void {
     const preset = VIEWS[id];
     this.viewId = id;
+    this.cam.tpanX = 0;
+    this.cam.tpanZ = 0;
+    this.cam.panX = 0;
+    this.cam.panZ = 0;
     // 竖屏：统一从 +x 方向看，让 16 列沿屏幕长边走（保留各预设的仰角/构图）
     this.cam.taz = this.portrait && preset.rotatePortrait ? Math.PI / 2 : preset.az;
     this.cam.tel = preset.el;
@@ -1561,6 +1612,32 @@ export class Studio {
     this.cam.tel = clamp(this.cam.tel + dy * 0.0035, 0.16, 1.52);
   }
 
+  /** 中键平移：在地面平面内移动相机目标点，保持俯仰/距离不变 */
+  pan(dx: number, dy: number): void {
+    this.markFree();
+    const height = Math.max(1, this.canvas.clientHeight);
+    const k = (2 * this.cam.dist * Math.tan((this.cam.fov * Math.PI) / 360)) / height;
+    const az = this.cam.az;
+    const rightX = Math.cos(az);
+    const rightZ = -Math.sin(az);
+    // 屏幕"上"方向投影到地面：朝相机的一侧；除以 sin(el) 补偿俯视压缩
+    const sinEl = Math.max(0.35, Math.sin(this.cam.el));
+    const upX = Math.sin(az);
+    const upZ = Math.cos(az);
+    const limitX = this.halfW + 8;
+    const limitZ = STAGE_HALF_D + 4;
+    this.cam.tpanX = clamp(
+      this.cam.tpanX - rightX * dx * k + (upX * dy * k) / sinEl,
+      -limitX,
+      limitX,
+    );
+    this.cam.tpanZ = clamp(
+      this.cam.tpanZ - rightZ * dx * k + (upZ * dy * k) / sinEl,
+      -limitZ,
+      limitZ,
+    );
+  }
+
   zoom(delta: number): void {
     this.markFree();
     this.cam.tdist = clamp(this.cam.tdist + delta * 0.012, this.zoomMin, this.zoomMax);
@@ -1587,6 +1664,25 @@ export class Studio {
 
   // ---------------------------------------------------------------- frame
 
+  /**
+   * 只收集窗口附近的方块：长曲的每帧成本与全曲长度无关。
+   * 先把上一帧的可见方块隐藏，再按步范围从 stepIndex 取本帧可见项。
+   */
+  private collectVisible(): void {
+    for (const b of this.visibleBlocks) b.mesh.visible = false;
+    this.visibleBlocks.length = 0;
+    const first = Math.max(0, Math.floor(this.viewStart) - 1);
+    const last = Math.min(MAX_STEPS - 1, Math.ceil(this.viewStart + this.windowColsValue) + 1);
+    for (let step = first; step <= last; step++) {
+      const list = this.stepIndex.get(step);
+      if (!list) continue;
+      for (const b of list) {
+        b.mesh.visible = true;
+        this.visibleBlocks.push(b);
+      }
+    }
+  }
+
   update(dt: number): void {
     this.elapsed += dt;
 
@@ -1598,12 +1694,14 @@ export class Studio {
     this.cam.fov = damp(this.cam.fov, this.cam.tfov, prefersReducedMotion() ? 30 : 5, dt);
     this.cam.lookY = damp(this.cam.lookY, this.cam.tlookY, prefersReducedMotion() ? 30 : 5.2, dt);
     this.cam.parallax = damp(this.cam.parallax, this.cam.tparallax, 6, dt);
+    this.cam.panX = damp(this.cam.panX, this.cam.tpanX, prefersReducedMotion() ? 30 : 5.2, dt);
+    this.cam.panZ = damp(this.cam.panZ, this.cam.tpanZ, prefersReducedMotion() ? 30 : 5.2, dt);
 
     if (Math.abs(this.camera.fov - this.cam.fov) > 0.002) {
       this.camera.fov = this.cam.fov;
       this.camera.updateProjectionMatrix();
     }
-    this.lookAt.set(0, this.cam.lookY, 0);
+    this.lookAt.set(this.cam.panX, this.cam.lookY, this.cam.panZ);
 
     // 俯视/正视要当"静图"看：去掉空闲漂移，视差也按预设压到很低
     const drift = this.viewId === 'persp' || this.viewId === 'free' ? Math.sin(this.elapsed * 0.16) * 0.006 : 0;
@@ -1641,11 +1739,9 @@ export class Studio {
       }
     }
 
-    for (const b of this.blocks.values()) {
-      // 窗口外不渲染、不更新：draw call 不随曲长增长
-      const visible = this.inWindow(b.step);
-      if (b.mesh.visible !== visible) b.mesh.visible = visible;
-      if (!visible) continue;
+    this.collectVisible();
+
+    for (const b of this.visibleBlocks) {
       if (b.delay > 0) {
         b.delay -= dt;
       } else {
@@ -1669,8 +1765,7 @@ export class Studio {
 
     // 顶面音高色片跟随方块
     let ci = 0;
-    for (const b of this.blocks.values()) {
-      if (!b.mesh.visible) continue;
+    for (const b of this.visibleBlocks) {
       this.capDummy.position.set(b.sx.value, b.sy.value + 0.5 * b.ss.value, b.sz.value);
       this.capDummy.scale.setScalar(Math.max(0.001, b.ss.value));
       this.capDummy.rotation.set(b.tiltX, 0, b.tiltZ);
@@ -1685,8 +1780,7 @@ export class Studio {
     if (this.caps.instanceColor) this.caps.instanceColor.needsUpdate = true;
 
     let bi = 0;
-    for (const b of this.blocks.values()) {
-      if (!b.mesh.visible) continue;
+    for (const b of this.visibleBlocks) {
       const lift = Math.max(0, b.sy.value - 0.5);
       const k = Math.max(0.25, 1 - lift * 0.9) * b.ss.value;
       this.blobDummy.position.set(b.sx.value + 0.05, 0.02, b.sz.value + 0.05);

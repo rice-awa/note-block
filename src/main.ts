@@ -17,6 +17,7 @@ import {
   loadBackup,
   loadLocal,
   MAX_BARS,
+  MAX_BARS_FINITE,
   MAX_STEPS,
   normalizeState,
   readShareCode,
@@ -97,29 +98,42 @@ function contentBars(): number {
   return Math.max(1, Math.ceil((studio.maxStep + 1) / MEASURE));
 }
 
-/** 曲长：有限模式 = bars*16；无限模式取内容与 bars 的较大者，上限 32 小节 */
+/** 曲长：有限模式 = bars*16；无限模式完全由内容决定，上限为工程安全边界 */
 function syncLength(): void {
   const content = contentBars();
-  if (infinite) bars = Math.min(MAX_BARS, Math.max(bars, content));
-  const length = (infinite ? Math.max(bars, content) : bars) * MEASURE;
-  clock.setLength(Math.min(MAX_BARS * MEASURE, length));
-  studio.setScrollable(clock.length > windowCols());
+  if (infinite) bars = Math.max(1, Math.min(MAX_BARS, content));
+  const length = clampBars(bars, infinite ? MAX_BARS : MAX_BARS_FINITE) * MEASURE;
+  clock.setLength(Math.min(MAX_STEPS, length));
+  // 无限模式始终允许滑动窗口：1 小节空曲也要能从右缘继续生长；
+  // windowLimit 只比曲末多 1 列，避免窗口滑进大片空白。
+  studio.setStepLimit(infinite ? MAX_STEPS : clock.length);
+  studio.setWindowLimit(clock.length + (infinite ? 1 : 0));
+  studio.setScrollable(infinite || clock.length > windowCols());
   hud.setLength(clock.length);
+  hud.setTiming(60 / (clock.bpm * 4));
   hud.setEmpty(studio.blockCount === 0);
   syncPanel();
 }
 
+let panelSyncQueued = false;
 function syncPanel(): void {
-  configPanel?.sync({
-    bars,
-    bpm: clock.bpm,
-    loop,
-    infinite,
-    notes: studio.blockCount,
-    windowCols: prefs.windowCols,
-    masterGain: audio.masterGain,
-    reverb: audio.reverbSend,
-    canRestore: hasBackup(),
+  // 绘制笔触时每个格子都会触发；用 rAF 合并，避免反复读 hasBackup / 重写面板
+  if (panelSyncQueued) return;
+  panelSyncQueued = true;
+  requestAnimationFrame(() => {
+    panelSyncQueued = false;
+    configPanel?.sync({
+      bars,
+      bpm: clock.bpm,
+      loop,
+      infinite,
+      notes: studio.blockCount,
+      windowCols: prefs.windowCols,
+      masterGain: audio.masterGain,
+      reverb: audio.reverbSend,
+      lengthSteps: clock.length,
+      canRestore: hasBackup(),
+    });
   });
 }
 
@@ -186,6 +200,11 @@ function redo(): void {
 
 function toggleInfinite(): void {
   void unlock();
+  const content = contentBars();
+  if (infinite && content > MAX_BARS_FINITE) {
+    hud.showToast(`内容已有 ${content} 小节，先删减到 ${MAX_BARS_FINITE} 小节以内`, null, null, 3000);
+    return;
+  }
   record('mode');
   infinite = !infinite;
   hud.setInfinite(infinite);
@@ -200,14 +219,24 @@ function toggleInfinite(): void {
   hud.setStep(clock.playing ? Math.floor(clock.position) % MEASURE : -1);
   hud.setProgress(clock.position, clock.length);
   hud.dismissHint();
+  hud.showToast(
+    infinite ? '无限模式：写到哪，曲子就长到哪' : `已回到有限模式（最多 ${MAX_BARS_FINITE} 小节）`,
+    null,
+    null,
+    2400,
+  );
   markDirty();
 }
 
-/** 曲长改动：不得小于最后一个音符所在小节，低于时夹住并提示 */
+/** 曲长改动：只服务有限模式；不得小于最后一个音符所在小节 */
 function setBars(target: number): void {
-  const min = contentBars();
-  const wanted = Math.max(1, Math.min(MAX_BARS, Math.round(target)));
-  const next = clampBars(Math.max(min, wanted));
+  if (infinite) {
+    syncPanel();
+    return;
+  }
+  const min = Math.min(MAX_BARS_FINITE, contentBars());
+  const wanted = Math.max(1, Math.min(MAX_BARS_FINITE, Math.round(target)));
+  const next = clampBars(Math.max(min, wanted), MAX_BARS_FINITE);
   if (next > wanted) hud.showToast(`第 ${min} 小节还有音符`, null, null, 2400);
   if (next === bars) {
     syncPanel();
@@ -247,6 +276,7 @@ function setBpm(value: number, phase: GesturePhase): void {
   }
   clock.setBpm(next);
   hud.setBpm(clock.bpm);
+  hud.setTiming(60 / (clock.bpm * 4));
   syncPanel();
   markDirty();
 }
@@ -317,7 +347,7 @@ function clearAll(): void {
 
 function seekTo(step: number): void {
   void unlock();
-  const target = Math.max(0, Math.min(MAX_STEPS - 1, Math.round(step)));
+  const target = Math.max(0, Math.min(clock.length - 1, Math.round(step)));
   clock.seek(target);
   viewOffset = 0;
   if (studio.canScroll) studio.setWindow(Math.max(0, target - windowCols() * 0.7), true);
@@ -340,7 +370,12 @@ async function share(): Promise<void> {
   const url = shareUrl(capture());
   try {
     await navigator.clipboard.writeText(url);
-    hud.showToast('分享链接已复制到剪贴板', null, null, 2800);
+    hud.showToast(
+      url.length > 8000 ? '分享链接较长，部分应用可能会截断' : '分享链接已复制到剪贴板',
+      null,
+      null,
+      2800,
+    );
   } catch {
     window.prompt('复制这个链接分享你的作品', url);
   }
@@ -402,6 +437,7 @@ hud.onBpm = (delta) => {
   record('bpm');
   clock.setBpm(next);
   hud.setBpm(clock.bpm);
+  hud.setTiming(60 / (clock.bpm * 4));
   syncPanel();
   markDirty();
 };
@@ -424,6 +460,24 @@ hud.onInfinite = toggleInfinite;
 hud.onClear = clearAll;
 hud.onShare = () => void share();
 hud.onSeek = seekTo;
+
+let scrubWasPlaying = false;
+hud.onScrubStart = (step) => {
+  scrubWasPlaying = clock.playing;
+  if (clock.playing) {
+    clock.pause();
+    hud.setPlaying(false);
+    hud.setAtEnd(clock.atEnd);
+  }
+  seekTo(step);
+};
+hud.onScrubMove = (step) => seekTo(step);
+hud.onScrubEnd = (step) => {
+  seekTo(step);
+  const resume = scrubWasPlaying;
+  scrubWasPlaying = false;
+  if (resume) togglePlay();
+};
 studio.onViewChange = (id) => hud.setView(id);
 hud.onSettings = () => {
   examplesDrawer?.hide();
@@ -444,6 +498,7 @@ clock.onEnd = () => {
 
 const configPanel = new ConfigPanel(document.querySelector<HTMLElement>('#settings-body')!, {
   bars: (delta) => setBars(bars + delta),
+  barsValue: (value) => setBars(value),
   bpm: setBpm,
   loop: setLoop,
   infinite: () => toggleInfinite(),
@@ -579,6 +634,7 @@ if (sharedState) {
 // ---------------------------------------------------------------- input
 
 let orbit: { x: number; y: number } | null = null;
+let pan: { x: number; y: number } | null = null;
 let hoverBlock: BlockView | null = null;
 
 type StrokeMode = 'paint' | 'erase';
@@ -666,8 +722,9 @@ function lineCells(sx: number, sy: number, ex: number, ey: number): Cell[] {
 function paintCells(cells: Cell[]): number {
   let added = 0;
   let sounded = 0;
+  const limit = infinite ? MAX_STEPS : Math.min(MAX_STEPS, clock.length);
   for (const cell of cells) {
-    if (cell.step < 0 || cell.step >= MAX_STEPS) break;
+    if (cell.step < 0 || cell.step >= limit) break;
     if (studio.blockAt(cell.step, cell.row)) continue;
     if (!studio.addBlock(cell.step, cell.row, PAINT_MIDI, false, 0, true)) continue;
     added++;
@@ -839,8 +896,8 @@ function armEdgeScroll(): void {
     edgeArmed = false;
     const p = stroke;
     if (!p || p.mode !== 'paint' || !studio.canScroll) return;
-    // 有限长曲只在曲长内翻页；无限模式画到哪长到哪，上限仍是 32 小节
-    const limit = infinite ? MAX_STEPS : clock.length;
+    // 无限模式可以画到曲末下一列；画出新音符后 syncLength 会把曲长顶上去
+    const limit = infinite ? clock.length + 1 : clock.length;
     if (studio.windowTarget + windowCols() >= limit) {
       disarmEdge();
       return;
@@ -862,6 +919,14 @@ function pinchFromTouches(): { cx: number; cy: number; dist: number } | null {
   };
 }
 
+// 中键拖拽：压掉浏览器自带的自动滚动 / 粘贴行为
+canvas.addEventListener('mousedown', (e) => {
+  if (e.button === 1) e.preventDefault();
+});
+canvas.addEventListener('auxclick', (e) => {
+  if (e.button === 1) e.preventDefault();
+});
+
 canvas.addEventListener('pointerdown', (e) => {
   if (drawer.isOpen) return;
   // 边缘手柄拖拽优先于方块拾取 / 绘制
@@ -879,6 +944,13 @@ canvas.addEventListener('pointerdown', (e) => {
       canvas.style.cursor = 'grabbing';
       return;
     }
+  }
+  if (e.button === 1) {
+    e.preventDefault();
+    pan = { x: e.clientX, y: e.clientY };
+    capturePointer(e.pointerId);
+    canvas.style.cursor = 'move';
+    return;
   }
   if (e.button === 2) {
     if (!stroke && !studio.isDragging) startErase(e);
@@ -935,6 +1007,11 @@ canvas.addEventListener('pointermove', (e) => {
     studio.setHover(studio.dragTargetCell(), false);
     return;
   }
+  if (pan) {
+    studio.pan(e.clientX - pan.x, e.clientY - pan.y);
+    pan = { x: e.clientX, y: e.clientY };
+    return;
+  }
   if (orbit) {
     studio.orbit(e.clientX - orbit.x, e.clientY - orbit.y);
     orbit = { x: e.clientX, y: e.clientY };
@@ -974,11 +1051,15 @@ function endPointer(e: PointerEvent): void {
   if (studio.isResizing) return;
   if (stroke) finishStroke();
   if (studio.isDragging) commitDrag();
+  if (pan) {
+    pan = null;
+    canvas.style.cursor = 'default';
+  }
   if (orbit) {
     orbit = null;
     canvas.style.cursor = 'default';
   }
-  if (!stroke && !studio.isDragging && !orbit) updateHover(e);
+  if (!stroke && !studio.isDragging && !orbit && !pan) updateHover(e);
 }
 
 canvas.addEventListener('pointerup', endPointer);
@@ -1044,8 +1125,26 @@ function nextView(): PresetView {
   return VIEW_CYCLE[(index < 0 ? 0 : index + 1) % VIEW_CYCLE.length];
 }
 
+function isTextEntry(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  if (el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') return true;
+  if (el.tagName === 'INPUT') {
+    const type = (el as HTMLInputElement).type;
+    return !['number', 'range', 'button', 'checkbox', 'radio', 'color', 'file'].includes(type);
+  }
+  return false;
+}
+
 window.addEventListener('keydown', (e) => {
   const el = e.target as HTMLElement | null;
+  // 空格只绑定播放/暂停：按钮、数字输入、滑杆、画布上一律生效；文字输入框放行
+  if (e.code === 'Space') {
+    if (isTextEntry(el)) return;
+    e.preventDefault();
+    if (!e.repeat) togglePlay();
+    return;
+  }
   if (el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
   const mod = e.metaKey || e.ctrlKey;
 
@@ -1059,10 +1158,6 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     redo();
     return;
-  }
-  if (e.code === 'Space' && el?.tagName !== 'BUTTON') {
-    e.preventDefault();
-    togglePlay();
   }
   if (e.key === ',' || e.key === '，') {
     e.preventDefault();

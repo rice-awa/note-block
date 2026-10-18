@@ -1,4 +1,5 @@
 import { ROWS } from './rows';
+import { formatDuration } from './song';
 import type { ViewId } from './views';
 
 export class Hud {
@@ -11,6 +12,9 @@ export class Hud {
   onClear: (() => void) | null = null;
   onShare: (() => void) | null = null;
   onSeek: ((step: number) => void) | null = null;
+  onScrubStart: ((step: number) => void) | null = null;
+  onScrubMove: ((step: number) => void) | null = null;
+  onScrubEnd: ((step: number) => void) | null = null;
   onRewind: (() => void) | null = null;
   onSettings: (() => void) | null = null;
   onExamples: (() => void) | null = null;
@@ -32,6 +36,10 @@ export class Hud {
   private rail = document.querySelector<HTMLElement>('#rail')!;
   private railFill = document.querySelector<HTMLElement>('#railFill')!;
   private railThumb = document.querySelector<HTMLElement>('#railThumb')!;
+  private railTicks = document.querySelector<HTMLElement>('#railTicks')!;
+  private railTip = document.querySelector<HTMLElement>('#railTip')!;
+  private railNow = document.querySelector<HTMLElement>('#railNow')!;
+  private railEnd = document.querySelector<HTMLElement>('#railEnd')!;
   private toastEl = document.querySelector<HTMLElement>('#toast')!;
   private toastText = document.querySelector<HTMLElement>('#toast-text')!;
   private toastAction = document.querySelector<HTMLButtonElement>('#toast-action')!;
@@ -43,6 +51,9 @@ export class Hud {
 
   private length = 16;
   private position = 0;
+  private stepDur = 60 / (108 * 4);
+  private nowText = '';
+  private endText = '';
   private atEnd = false;
   private measureIndex = 0;
   private toastTimer = 0;
@@ -109,25 +120,48 @@ export class Hud {
     }
   }
 
+  private railStep(clientX: number): number {
+    const rect = this.rail.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / Math.max(1, rect.width)));
+    return Math.round(ratio * Math.max(0, this.length - 1));
+  }
+
+  private showTip(clientX: number): void {
+    const rect = this.rail.getBoundingClientRect();
+    const step = this.railStep(clientX);
+    const bar = Math.floor(step / 16) + 1;
+    this.railTip.textContent = `M${pad2(bar)} · ${formatDuration(step * this.stepDur)}`;
+    this.railTip.style.left = `${Math.min(rect.width, Math.max(0, clientX - rect.left))}px`;
+    this.railTip.hidden = false;
+  }
+
+  private hideTip(): void {
+    this.railTip.hidden = true;
+  }
+
   private bindRail(): void {
-    const seekFromEvent = (clientX: number): void => {
-      const rect = this.rail.getBoundingClientRect();
-      const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-      this.onSeek?.(Math.round(ratio * Math.max(1, this.length - 1)));
-    };
     this.rail.addEventListener('pointerdown', (e) => {
       this.railScrubbing = true;
       this.rail.setPointerCapture(e.pointerId);
-      seekFromEvent(e.clientX);
+      const step = this.railStep(e.clientX);
+      this.showTip(e.clientX);
+      this.onScrubStart?.(step);
     });
     this.rail.addEventListener('pointermove', (e) => {
-      if (this.railScrubbing) seekFromEvent(e.clientX);
+      this.showTip(e.clientX);
+      if (this.railScrubbing) this.onScrubMove?.(this.railStep(e.clientX));
     });
-    const end = (): void => {
+    const end = (e: PointerEvent): void => {
+      if (!this.railScrubbing) return;
       this.railScrubbing = false;
+      this.onScrubEnd?.(this.railStep(e.clientX));
     };
     this.rail.addEventListener('pointerup', end);
     this.rail.addEventListener('pointercancel', end);
+    this.rail.addEventListener('lostpointercapture', end);
+    this.rail.addEventListener('pointerleave', () => {
+      if (!this.railScrubbing) this.hideTip();
+    });
     this.rail.addEventListener('keydown', (e) => {
       const coarse = e.shiftKey ? 4 : 1;
       if (e.key === 'ArrowLeft') {
@@ -139,6 +173,9 @@ export class Hud {
       } else if (e.key === 'Home') {
         e.preventDefault();
         this.onSeek?.(0);
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        this.onSeek?.(Math.max(0, this.length - 1));
       }
     });
   }
@@ -189,10 +226,32 @@ export class Hud {
     this.infiniteBtn.setAttribute('aria-label', on ? '退出无限模式' : '进入无限模式');
   }
 
+  /** 每步时长（秒）：由 main 在 BPM / 曲长变化时传入 */
+  setTiming(stepDur: number): void {
+    const next = Number.isFinite(stepDur) ? Math.max(0.0001, stepDur) : this.stepDur;
+    if (next === this.stepDur) return;
+    this.stepDur = next;
+    this.updateTime(true);
+  }
+
   setLength(length: number): void {
-    this.length = Math.max(1, Math.round(length));
-    this.rail.setAttribute('aria-valuemax', String(this.length));
+    const next = Math.max(1, Math.round(length));
+    if (next !== this.length) {
+      this.length = next;
+      this.rail.setAttribute('aria-valuemax', String(Math.max(0, this.length - 1)));
+    }
+    this.updateTicks();
     this.updateMeasure();
+    this.updateTime(true);
+  }
+
+  private updateTicks(): void {
+    const bars = Math.max(1, Math.ceil(this.length / 16));
+    let every = 1;
+    while (bars / every > 12) every *= 2;
+    const count = bars / every;
+    this.railTicks.style.setProperty('--tick', `${100 / count}%`);
+    this.railTicks.classList.toggle('is-hidden', bars < 2);
   }
 
   setMeasure(measure: number, bars: number): void {
@@ -206,6 +265,23 @@ export class Hud {
     this.barsEl.textContent = pad2(Math.max(1, Math.ceil(this.length / 16)));
   }
 
+  private updateTime(force = false): void {
+    const now = formatDuration(this.position * this.stepDur);
+    const end = formatDuration(this.length * this.stepDur);
+    if (force || now !== this.nowText) {
+      this.railNow.textContent = now;
+      this.nowText = now;
+    }
+    if (force || end !== this.endText) {
+      this.railEnd.textContent = end;
+      this.endText = end;
+    }
+    this.rail.setAttribute(
+      'aria-valuetext',
+      `M${pad2(this.measureIndex + 1)} · ${now} / ${end}`,
+    );
+  }
+
   setProgress(position: number, length: number): void {
     if (length !== this.length) this.setLength(length);
     this.position = position;
@@ -213,6 +289,7 @@ export class Hud {
     this.railFill.style.transform = `scaleX(${ratio.toFixed(4)})`;
     this.railThumb.style.left = `${(ratio * 100).toFixed(3)}%`;
     this.rail.setAttribute('aria-valuenow', String(Math.round(position)));
+    this.updateTime();
   }
 
   setStep(step: number): void {
