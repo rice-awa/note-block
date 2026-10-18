@@ -97,6 +97,8 @@ export class Drawer {
     const done = (): void => {
       if (this.open) return;
       this.panel.hidden = true;
+      // 另一个抽屉已经接管：旧关闭定时器不能把焦点抢回页面
+      if (document.body.classList.contains('drawer-open')) return;
       if (this.lastFocus && document.contains(this.lastFocus)) this.lastFocus.focus();
       else this.trigger?.focus();
       this.lastFocus = null;

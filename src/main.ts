@@ -4,7 +4,11 @@ import { ConfigPanel, type GesturePhase } from './config-panel';
 import { Drawer } from './drawer';
 import { ExamplePanel } from './example-panel';
 import { EXAMPLES, type Example } from './examples';
+import { GestureController, type GestureHost } from './gestures';
 import { Hud } from './hud';
+import { formatHover } from './note-label';
+import { NotePanel } from './note-panel';
+import { SaveCoordinator, saveStatusText } from './persistence';
 import { clampWindowCols, loadPrefs, savePrefs, type Prefs } from './prefs';
 import { DEMO, MAX_MIDI, MIN_MIDI, ROWS } from './rows';
 import { Studio, type BlockView, type Cell, type PaintCell } from './scene';
@@ -22,12 +26,13 @@ import {
   normalizeState,
   readShareCode,
   saveBackup,
-  saveLocal,
   shareUrl,
+  storageAvailable,
   type Note,
   type SongState,
   type SongStateInput,
 } from './song';
+import { ViewportWatcher } from './viewport';
 
 const MEASURE = 16;
 /** 可见列数随边缘拖拽 / 配置面板变化，窗口跟随全部按它算 */
@@ -40,6 +45,7 @@ const hud = new Hud();
 const history = new History(40);
 const mutedRows = new Set<number>();
 const prefs: Prefs = loadPrefs();
+const readoutEl = document.querySelector<HTMLElement>('#readout')!;
 
 audio.setMasterGain(prefs.masterGain);
 audio.setReverbSend(prefs.reverb);
@@ -57,8 +63,29 @@ let loop = true;
 let viewOffset = 0;
 let prevPos = 0;
 let dragPre: SongState | null = null;
-let saveTimer = 0;
-let lastSavedAt = 0;
+let dragFrom: Cell | null = null;
+
+interface Selection {
+  step: number;
+  row: number;
+  midi: number;
+}
+/** UI 选择：不持久化、不进分享与撤销；坐标 + 音高用于确认还是同一个音符 */
+let selected: Selection | null = null;
+/** 绘制 / 擦除期间先保留编辑条，抬笔后再收起，避免中途改变有效视口导致取格偏移 */
+let clearSelectionAfterStroke = false;
+
+// 抽屉 / 面板引用在函数里使用，构造顺序靠后
+let configPanel: ConfigPanel | null = null;
+let drawer: Drawer | null = null;
+let examplesDrawer: Drawer | null = null;
+let helpDrawer: Drawer | null = null;
+let examplePanel: ExamplePanel | null = null;
+let notePanel: NotePanel | null = null;
+let viewport: ViewportWatcher | null = null;
+let gestures: GestureController | null = null;
+let rowsUserSet = false;
+let rowsInit = false;
 
 const capture = (): SongState => ({
   notes: studio.getNotes(),
@@ -69,29 +96,29 @@ const capture = (): SongState => ({
 });
 
 const record = (key?: string): void => {
-  // 只要发生了新的可撤销操作，旧 toast 的"撤销"就不再指向那次操作了
-  hud.hideToast();
+  // 只要发生了新的可撤销操作，旧提示的"撤销"就不再指向那次操作了
+  hud.hideFeedback();
   history.record(capture(), key);
 };
 
+const persistence = new SaveCoordinator({
+  getState: capture,
+  onStatus: () => refreshSaveStatus(),
+});
+
 function markDirty(): void {
-  window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    saveLocal(capture());
-    lastSavedAt = Date.now();
-    updateSavedLabel();
-  }, 500);
+  persistence.markDirty();
 }
 
-function updateSavedLabel(): void {
-  if (!lastSavedAt) {
-    configPanel?.setSavedLabel('自动存档 · 本地');
-    return;
-  }
-  const seconds = Math.max(0, Math.round((Date.now() - lastSavedAt) / 1000));
-  const when = seconds < 5 ? '刚刚' : seconds < 60 ? `${seconds} 秒前` : `${Math.floor(seconds / 60)} 分钟前`;
-  configPanel?.setSavedLabel(`自动存档 · ${when}`);
+function refreshSaveStatus(): void {
+  const snap = persistence.snapshot;
+  const text = saveStatusText(snap, Date.now());
+  configPanel?.setSaveState(snap.status, text);
+  hud.setSaveStatus(snap.status, text, snap.status === 'failed');
 }
+
+history.onChange = () => hud.setHistory(history.canUndo, history.canRedo);
+hud.setHistory(false, false);
 
 /** 内容占用的整小节数 */
 function contentBars(): number {
@@ -133,6 +160,7 @@ function syncPanel(): void {
       reverb: audio.reverbSend,
       lengthSteps: clock.length,
       canRestore: hasBackup(),
+      saveStatus: persistence.snapshot.status,
     });
   });
 }
@@ -144,6 +172,135 @@ function sameNotes(a: Note[], b: Note[]): boolean {
   for (const note of b) if (!set.has(key(note))) return false;
   return true;
 }
+
+// ---------------------------------------------------------------- selection
+
+function selectNote(cell: Cell): void {
+  const block = studio.blockAt(cell.step, cell.row);
+  if (!block) {
+    clearSelection();
+    return;
+  }
+  selected = { step: block.step, row: block.row, midi: block.midi };
+  studio.setSelection(selected);
+  syncNotePanel();
+}
+
+function clearSelection(): void {
+  const wasOpen = notePanel?.isOpen ?? false;
+  selected = null;
+  studio.setSelection(null);
+  notePanel?.hide();
+  document.body.classList.remove('note-open');
+  hideReadout();
+  if (wasOpen) viewport?.refresh();
+}
+
+function pauseNotePanel(): void {
+  if (!notePanel?.isOpen) return;
+  notePanel.hide();
+  document.body.classList.remove('note-open');
+  viewport?.refresh();
+}
+
+function resumeNotePanel(): void {
+  window.setTimeout(() => {
+    if (anyDrawerOpen()) return;
+    if (selected) verifySelection();
+  }, 0);
+}
+
+/** 撤销 / 重做 / 载入后重新确认选择仍指向同一个音符 */
+function verifySelection(): void {
+  if (!selected) {
+    studio.setSelection(null);
+    notePanel?.hide();
+    return;
+  }
+  const block = studio.blockAt(selected.step, selected.row);
+  if (!block || block.midi !== selected.midi) {
+    clearSelection();
+    return;
+  }
+  studio.setSelection(selected);
+  syncNotePanel();
+}
+
+function syncNotePanel(): void {
+  if (!selected) {
+    notePanel?.hide();
+    return;
+  }
+  // 模态抽屉打开时收起编辑条；选择本身保留，关闭抽屉后恢复
+  if (anyDrawerOpen()) {
+    pauseNotePanel();
+    return;
+  }
+  const block = studio.blockAt(selected.step, selected.row);
+  if (!block || block.midi !== selected.midi) {
+    clearSelection();
+    return;
+  }
+  const wasOpen = notePanel?.isOpen ?? false;
+  notePanel?.show({
+    step: block.step,
+    row: block.row,
+    midi: block.midi,
+    rowLabel: ROWS[block.row].label,
+    voice: ROWS[block.row].voice,
+    canDown: block.midi > MIN_MIDI,
+    canUp: block.midi < MAX_MIDI,
+  });
+  document.body.classList.add('note-open');
+  if (!wasOpen) viewport?.refresh();
+}
+
+function shiftSelected(delta: -1 | 1): void {
+  if (!selected) return;
+  const block = studio.blockAt(selected.step, selected.row);
+  if (!block) {
+    clearSelection();
+    return;
+  }
+  const next = Math.max(MIN_MIDI, Math.min(MAX_MIDI, block.midi + delta));
+  if (next === block.midi) {
+    syncNotePanel();
+    return;
+  }
+  record(`pitch:${block.step}:${block.row}`);
+  studio.setPitch(block.step, block.row, next);
+  audio.play(voice(block.row), next, 0, 0.8);
+  selected = { step: block.step, row: block.row, midi: next };
+  syncNotePanel();
+  markDirty();
+}
+
+function previewSelected(): void {
+  if (!selected) return;
+  const block = studio.blockAt(selected.step, selected.row);
+  if (!block) return;
+  void unlock().then(() => audio.play(voice(block.row), block.midi, 0, 1));
+}
+
+function deleteSelected(): void {
+  if (!selected) return;
+  const block = studio.blockAt(selected.step, selected.row);
+  if (!block) {
+    clearSelection();
+    return;
+  }
+  const { step, row } = block;
+  record();
+  audio.sfx('sfx_break', 0, 1, 0.5);
+  studio.removeBlock(step, row);
+  clearSelection();
+  hoverBlock = null;
+  studio.setHover(null);
+  syncLength();
+  markDirty();
+}
+
+// ---------------------------------------------------------------- 状态切换
 
 function applyState(next: SongStateInput, animate = false): void {
   // 旧调用只给 notes/bpm/infinite：归一化补 bars/loop，不切掉任何音符
@@ -170,12 +327,13 @@ function applyState(next: SongStateInput, animate = false): void {
   hud.setStep(clock.playing ? Math.floor(clock.position) % MEASURE : -1);
   hud.setProgress(clock.position, clock.length);
   hud.setEmpty(studio.blockCount === 0);
+  verifySelection();
   markDirty();
   if (examplesDrawer?.isOpen) examplePanel?.refresh();
 }
 
 function undo(animated = false): void {
-  hud.hideToast();
+  hud.hideFeedback();
   const prev = history.undo(capture());
   if (!prev) {
     hud.showToast('没有可撤销的操作', null, null, 2000);
@@ -191,7 +349,7 @@ function undo(animated = false): void {
 }
 
 function redo(): void {
-  hud.hideToast();
+  hud.hideFeedback();
   const next = history.redo(capture());
   if (!next) return;
   applyState(next);
@@ -281,6 +439,21 @@ function setBpm(value: number, phase: GesturePhase): void {
   markDirty();
 }
 
+/** 播放栏里就地输入的 BPM：一次提交一条历史 */
+function setBpmValue(value: number): void {
+  const next = Math.max(60, Math.min(180, Math.round(value)));
+  if (!Number.isFinite(next) || next === clock.bpm) {
+    syncPanel();
+    return;
+  }
+  record('bpm');
+  clock.setBpm(next);
+  hud.setBpm(clock.bpm);
+  hud.setTiming(60 / (clock.bpm * 4));
+  syncPanel();
+  markDirty();
+}
+
 function setMasterGain(value: number): void {
   prefs.masterGain = Math.min(1, Math.max(0, value));
   audio.setMasterGain(prefs.masterGain);
@@ -327,22 +500,52 @@ function applyDraggedCols(cols: number, phase: 'start' | 'move' | 'end'): void {
   if (phase === 'end') audio.sfx('sfx_click', 0, 1.04, 0.09);
 }
 
+/** 抽屉内触发的操作把反馈留在抽屉里；否则回到主页面 */
+function feedbackTarget(): 'page' | 'settings' | 'examples' {
+  if (drawer?.isOpen) return 'settings';
+  if (examplesDrawer?.isOpen) return 'examples';
+  return 'page';
+}
+
+function showOperationFeedback(
+  text: string,
+  actionLabel: string | null,
+  onAction: (() => void) | null,
+  ttl = 5200,
+  focusAction = false,
+): void {
+  const target = feedbackTarget();
+  if (target === 'page') hud.showToast(text, actionLabel, onAction, ttl, focusAction);
+  else hud.showDrawerFeedback(target, text, actionLabel, onAction, ttl, focusAction);
+}
+
+function backupWarning(result: { ok: boolean }): string {
+  return result.ok ? '' : ' · 备份失败，刷新后无法恢复';
+}
+
 function clearAll(): void {
   const count = studio.blockCount;
   if (!count) return;
-  void (async () => {
-    await unlock();
-    record();
-    audio.wipe();
-    window.setTimeout(() => audio.thump(0.42), 280);
-    studio.clearAnimated();
-    syncLength();
-    hud.setEmpty(true);
-    hud.setProgress(Math.min(clock.position, clock.length - 1), clock.length);
-    markDirty();
-    hud.dismissHint();
-    hud.showToast(`已清空 ${count} 个方块`, '撤销', () => undo(true), 5200);
-  })();
+  const backup = saveBackup(capture(), '清空前');
+  void unlock();
+  record();
+  audio.wipe();
+  window.setTimeout(() => audio.thump(0.42), 280);
+  const cleared = studio.clearAnimated();
+  clearSelection();
+  syncLength();
+  hud.setEmpty(true);
+  hud.setProgress(Math.min(clock.position, clock.length - 1), clock.length);
+  markDirty();
+  hud.dismissHint();
+  showOperationFeedback(
+    `已清空 ${cleared || count} 个音符${backupWarning(backup)}`,
+    '撤销',
+    () => undo(true),
+    5600,
+    true,
+  );
+  syncPanel();
 }
 
 function seekTo(step: number): void {
@@ -368,16 +571,19 @@ function rewind(): void {
 async function share(): Promise<void> {
   void unlock();
   const url = shareUrl(capture());
+  const long = url.length > 8000;
   try {
     await navigator.clipboard.writeText(url);
-    hud.showToast(
-      url.length > 8000 ? '分享链接较长，部分应用可能会截断' : '分享链接已复制到剪贴板',
+    showOperationFeedback(
+      long ? '分享链接较长，部分应用可能会截断' : '分享链接已复制到剪贴板',
       null,
       null,
       2800,
     );
   } catch {
-    window.prompt('复制这个链接分享你的作品', url);
+    // 不能把「链接已生成」当成「已复制」：把链接放到地址栏，交给用户手动复制
+    window.history.replaceState(null, '', url);
+    showOperationFeedback('未能自动复制，链接已放到地址栏，可直接复制', null, null, 6000);
   }
 }
 
@@ -390,8 +596,19 @@ async function unlock(): Promise<void> {
   await audio.unlock();
 }
 
-window.addEventListener('pointerdown', () => void unlock(), { capture: true });
+window.addEventListener(
+  'pointerdown',
+  (e) => {
+    void unlock();
+    const touch = e.pointerType === 'touch' || e.pointerType === 'pen';
+    document.body.dataset.input = touch ? 'touch' : 'mouse';
+  },
+  { capture: true },
+);
 window.addEventListener('keydown', () => void unlock(), { capture: true });
+
+document.body.dataset.input =
+  typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches ? 'touch' : 'mouse';
 
 // 音序器：调度时只排音频，视觉由 drainVisual 按同一时间点触发
 const clock = new Clock(audio, (step, when) => {
@@ -441,6 +658,7 @@ hud.onBpm = (delta) => {
   syncPanel();
   markDirty();
 };
+hud.onBpmValue = setBpmValue;
 hud.onMuteRow = (row) => {
   if (mutedRows.has(row)) mutedRows.delete(row);
   else mutedRows.add(row);
@@ -455,11 +673,33 @@ hud.onView = (id) => {
   studio.setView(id);
   audio.sfx('sfx_click', 0, id === 'persp' ? 1 : id === 'top' ? 1.12 : 1.26, 0.16);
 };
+hud.onFitStage = () => {
+  void unlock();
+  studio.fitStage();
+  audio.sfx('sfx_click', 0, 1.06, 0.12);
+};
 studio.onResize = applyDraggedCols;
 hud.onInfinite = toggleInfinite;
 hud.onClear = clearAll;
 hud.onShare = () => void share();
 hud.onSeek = seekTo;
+hud.onUndo = () => undo();
+hud.onRedo = redo;
+hud.onRowsToggle = () => {
+  rowsUserSet = true;
+  viewport?.refresh();
+};
+hud.onHintDismiss = () => {
+  prefs.helpSeen = true;
+  savePrefs(prefs);
+};
+hud.onRetrySave = () => {
+  const result = persistence.retry();
+  refreshSaveStatus();
+  syncPanel();
+  if (result.ok) hud.showToast('已保存到此浏览器', null, null, 2200);
+  else hud.showToast('仍未保存到本机', null, null, 2600);
+};
 
 let scrubWasPlaying = false;
 hud.onScrubStart = (step) => {
@@ -479,14 +719,6 @@ hud.onScrubEnd = (step) => {
   if (resume) togglePlay();
 };
 studio.onViewChange = (id) => hud.setView(id);
-hud.onSettings = () => {
-  examplesDrawer?.hide();
-  drawer.toggle();
-};
-hud.onExamples = () => {
-  drawer.hide();
-  examplesDrawer?.toggle();
-};
 clock.onEnd = () => {
   hud.setPlaying(false);
   hud.setAtEnd(true);
@@ -496,7 +728,7 @@ clock.onEnd = () => {
 
 // ---------------------------------------------------------------- 配置抽屉
 
-const configPanel = new ConfigPanel(document.querySelector<HTMLElement>('#settings-body')!, {
+configPanel = new ConfigPanel(document.querySelector<HTMLElement>('#settings-body')!, {
   bars: (delta) => setBars(bars + delta),
   barsValue: (value) => setBars(value),
   bpm: setBpm,
@@ -508,25 +740,38 @@ const configPanel = new ConfigPanel(document.querySelector<HTMLElement>('#settin
   share: () => void share(),
   restore: () => restoreBackup(),
   clear: clearAll,
+  retrySave: () => {
+    const result = persistence.retry();
+    refreshSaveStatus();
+    syncPanel();
+    if (!result.ok) hud.showToast('仍未保存到本机', null, null, 2600);
+  },
 });
 
-const drawer = new Drawer({
+drawer = new Drawer({
   panel: document.querySelector<HTMLElement>('#settings-panel')!,
   scrim: document.querySelector<HTMLElement>('#drawer-scrim'),
   trigger: document.querySelector<HTMLElement>('#settings'),
   closeButton: document.querySelector<HTMLElement>('#settings-close'),
   onOpen: () => {
     hud.setSettingsOpen(true);
+    examplesDrawer?.hide();
+    helpDrawer?.hide();
+    gestures?.cancelAll();
+    pauseNotePanel();
     syncPanel();
-    updateSavedLabel();
+    refreshSaveStatus();
   },
-  onClose: () => hud.setSettingsOpen(false),
+  onClose: () => {
+    hud.setSettingsOpen(false);
+    hud.transferFeedback('settings');
+    gestures?.cancelAll();
+    resumeNotePanel();
+    viewport?.refresh();
+  },
 });
 
 // ---------------------------------------------------------------- 示例抽屉
-
-let examplePanel: ExamplePanel | null = null;
-let examplesDrawer: Drawer | null = null;
 
 examplePanel = new ExamplePanel(document.querySelector<HTMLElement>('#examples-body')!, {
   getState: capture,
@@ -540,16 +785,73 @@ examplesDrawer = new Drawer({
   closeButton: document.querySelector<HTMLElement>('#examples-close'),
   onOpen: () => {
     hud.setExamplesOpen(true);
+    drawer?.hide();
+    helpDrawer?.hide();
+    gestures?.cancelAll();
+    pauseNotePanel();
     examplePanel?.refresh();
   },
-  onClose: () => hud.setExamplesOpen(false),
+  onClose: () => {
+    hud.setExamplesOpen(false);
+    hud.transferFeedback('examples');
+    gestures?.cancelAll();
+    resumeNotePanel();
+    viewport?.refresh();
+  },
+});
+
+// ---------------------------------------------------------------- 玩法抽屉
+
+helpDrawer = new Drawer({
+  panel: document.querySelector<HTMLElement>('#help-panel')!,
+  scrim: document.querySelector<HTMLElement>('#drawer-scrim'),
+  trigger: document.querySelector<HTMLElement>('#help'),
+  closeButton: document.querySelector<HTMLElement>('#help-close'),
+  onOpen: () => {
+    hud.setHelpOpen(true);
+    drawer?.hide();
+    examplesDrawer?.hide();
+    gestures?.cancelAll();
+    pauseNotePanel();
+  },
+  onClose: () => {
+    hud.setHelpOpen(false);
+    gestures?.cancelAll();
+    resumeNotePanel();
+    viewport?.refresh();
+  },
+});
+
+hud.onSettings = () => {
+  examplesDrawer?.hide();
+  helpDrawer?.hide();
+  drawer?.toggle();
+};
+hud.onExamples = () => {
+  drawer?.hide();
+  helpDrawer?.hide();
+  examplesDrawer?.toggle();
+};
+hud.onHelp = () => {
+  drawer?.hide();
+  examplesDrawer?.hide();
+  helpDrawer?.toggle();
+};
+
+// ---------------------------------------------------------------- 音符编辑条
+
+notePanel = new NotePanel(document.querySelector<HTMLElement>('#note-panel')!, {
+  onShift: (delta) => shiftSelected(delta),
+  onPreview: () => previewSelected(),
+  onDelete: () => deleteSelected(),
+  onClose: () => clearSelection(),
 });
 
 /** 载入示例：先备份当前作品，再按列波次装配；撤销栈只留一条，Ctrl+Z 回到载入前 */
 function loadExample(example: Example): void {
   void unlock();
-  saveBackup(capture(), `载入《${example.name}》前`);
-  hud.hideToast();
+  const backup = saveBackup(capture(), `载入《${example.name}》前`);
+  hud.hideFeedback();
   history.push(capture());
   applyState(
     {
@@ -569,7 +871,12 @@ function loadExample(example: Example): void {
   hud.setStep(0);
   hud.setProgress(0, clock.length);
   examplePanel?.refresh();
-  hud.showToast(`已载入《${example.name}》`, '撤销', () => undo(true), 5600);
+  showOperationFeedback(
+    `已载入《${example.name}》${backupWarning(backup)}`,
+    '撤销',
+    () => undo(true),
+    5600,
+  );
   hud.dismissHint();
 }
 
@@ -581,14 +888,33 @@ function restoreBackup(): boolean {
     return false;
   }
   void unlock();
-  hud.hideToast();
+  hud.hideFeedback();
   history.push(capture());
   applyState(backup.state, true);
   clearBackup();
   syncPanel();
-  hud.showToast(backup.label ? `已恢复：${backup.label}` : '已恢复上次载入前的作品', null, null, 3400);
+  showOperationFeedback(backup.label ? `已恢复：${backup.label}` : '已恢复上次载入前的作品', null, null, 3400);
   return true;
 }
+
+// ---------------------------------------------------------------- viewport
+
+viewport = new ViewportWatcher(canvas, (info) => {
+  document.body.dataset.mode = info.mode;
+  if (!rowsInit) {
+    rowsInit = true;
+    if (!rowsUserSet) hud.setRowsOpen(info.mode === 'desktop');
+  }
+  if (info.orientationChanged) {
+    // 方向变了：旧坐标不再有效，结束当前手势，视图由场景重新适配
+    gestures?.cancelAll();
+    if (!rowsUserSet) hud.setRowsOpen(info.mode === 'desktop');
+  }
+  // 先同步画布尺寸，再把可用矩形交给相机
+  studio.resize();
+  studio.setStageRect(info.rect);
+});
+viewport.start();
 
 // ---------------------------------------------------------------- boot
 
@@ -623,18 +949,20 @@ hud.setEmpty(studio.blockCount === 0);
 hud.setView(studio.view);
 hud.setStep(-1);
 hud.setProgress(0, clock.length);
-if (savedState) lastSavedAt = Date.now();
-updateSavedLabel();
+persistence.adoptSavedAt(savedState ? Date.now() : null);
+if (!storageAvailable()) {
+  persistence.adoptFailure('unavailable');
+}
+refreshSaveStatus();
+if (prefs.helpSeen) hud.dismissHint();
 if (sharedState) {
   // 分享链接只负责"第一次打开"，之后编辑走本地存档，避免刷新又回到旧分享
   window.history.replaceState(null, '', window.location.pathname);
   window.setTimeout(() => hud.showToast('已载入分享的作品', null, null, 3000), 900);
 }
 
-// ---------------------------------------------------------------- input
+// ---------------------------------------------------------------- input / strokes
 
-let orbit: { x: number; y: number } | null = null;
-let pan: { x: number; y: number } | null = null;
 let hoverBlock: BlockView | null = null;
 
 type StrokeMode = 'paint' | 'erase';
@@ -668,26 +996,29 @@ let edgeTimer = 0;
 let edgeArmed = false;
 let suppressContextUntil = 0;
 
-const touchPoints = new Map<number, { x: number; y: number }>();
-let pinch: { cx: number; cy: number; dist: number } | null = null;
-
-/** 指针捕获：合成事件（自动化测试）没有真实 pointerId，捕获失败不应打断笔触 */
-function capturePointer(id: number): void {
-  try {
-    canvas.setPointerCapture(id);
-  } catch {
-    /* ignored */
+function updateReadout(cell: Cell | null, block: BlockView | null): void {
+  if (!cell || document.body.dataset.input === 'touch' || document.body.classList.contains('drawer-open')) {
+    hideReadout();
+    return;
   }
+  readoutEl.textContent = formatHover(cell.step, ROWS[cell.row].label, ROWS[cell.row].voice, block?.midi ?? null);
+  readoutEl.hidden = false;
+}
+
+function hideReadout(): void {
+  readoutEl.hidden = true;
 }
 
 function updateHover(e: PointerEvent): void {
   if (studio.isDragging) {
     studio.setHover(studio.dragTargetCell(), false);
+    hideReadout();
     return;
   }
   hoverBlock = studio.pickBlock(e);
   const cell = studio.pointerToCell(e);
   studio.setHover(cell);
+  updateReadout(cell, hoverBlock);
   if (hoverBlock) canvas.style.cursor = 'grab';
   else if (cell) canvas.style.cursor = 'crosshair';
   else canvas.style.cursor = 'default';
@@ -751,9 +1082,9 @@ function startStroke(e: PointerEvent, mode: StrokeMode, step: number, row: numbe
     clientY: e.clientY,
     shift: e.shiftKey,
   };
-  capturePointer(e.pointerId);
-  hud.hideToast();
+  hud.hideFeedback();
   hud.dismissHint();
+  hideReadout();
 }
 
 function startPaint(e: PointerEvent, exact: PaintCell): void {
@@ -839,19 +1170,7 @@ function advanceErase(exact: PaintCell): void {
   }
 }
 
-function finishStroke(): void {
-  const s = stroke;
-  stroke = null;
-  disarmEdge();
-  canvas.style.cursor = 'default';
-  if (!s) return;
-  if (s.mode === 'paint' ? s.added > 0 : s.removed > 0) history.push(s.before);
-  studio.setHover(null);
-  syncLength();
-  markDirty();
-}
-
-function paintMove(e: PointerEvent): void {
+function strokeMove(e: PointerEvent): void {
   const s = stroke;
   if (!s) return;
   s.clientX = e.clientX;
@@ -864,6 +1183,42 @@ function paintMove(e: PointerEvent): void {
   }
   if (s.mode === 'paint') advancePaint(exact, s.shift);
   else advanceErase(exact);
+}
+
+function finishStroke(): void {
+  const s = stroke;
+  stroke = null;
+  disarmEdge();
+  canvas.style.cursor = 'default';
+  if (!s) return;
+  if (s.mode === 'paint' ? s.added > 0 : s.removed > 0) history.push(s.before);
+  studio.setHover(null);
+  hoverBlock = null;
+  syncLength();
+  markDirty();
+  settleStrokeSelection();
+}
+
+/** 多指接管 / pointercancel：回滚本次尚未结束的笔触，不产生历史 */
+function cancelStroke(): void {
+  const s = stroke;
+  stroke = null;
+  disarmEdge();
+  canvas.style.cursor = 'default';
+  if (!s) return;
+  studio.setSong(s.before.notes, false);
+  studio.setHover(null);
+  hoverBlock = null;
+  syncLength();
+  markDirty();
+  settleStrokeSelection();
+}
+
+/** 笔触结束后再收起编辑条：活动期间舞台矩形保持不变，取格不偏移 */
+function settleStrokeSelection(): void {
+  if (!clearSelectionAfterStroke) return;
+  clearSelectionAfterStroke = false;
+  clearSelection();
 }
 
 function disarmEdge(): void {
@@ -909,129 +1264,17 @@ function armEdgeScroll(): void {
   }, EDGE_HOLD_MS);
 }
 
-function pinchFromTouches(): { cx: number; cy: number; dist: number } | null {
-  if (touchPoints.size < 2) return null;
-  const [a, b] = [...touchPoints.values()];
-  return {
-    cx: (a.x + b.x) / 2,
-    cy: (a.y + b.y) / 2,
-    dist: Math.hypot(a.x - b.x, a.y - b.y),
-  };
-}
-
-// 中键拖拽：压掉浏览器自带的自动滚动 / 粘贴行为
-canvas.addEventListener('mousedown', (e) => {
-  if (e.button === 1) e.preventDefault();
-});
-canvas.addEventListener('auxclick', (e) => {
-  if (e.button === 1) e.preventDefault();
-});
-
-canvas.addEventListener('pointerdown', (e) => {
-  if (drawer.isOpen) return;
-  // 边缘手柄拖拽优先于方块拾取 / 绘制
-  if (studio.isResizing) return;
-  void unlock();
-  if (e.pointerType === 'touch') {
-    touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (touchPoints.size >= 2) {
-      // 双指：结束笔触，进入 orbit / 捏合
-      if (stroke) finishStroke();
-      if (studio.isDragging) commitDrag();
-      orbit = null;
-      pinch = pinchFromTouches();
-      capturePointer(e.pointerId);
-      canvas.style.cursor = 'grabbing';
-      return;
-    }
-  }
-  if (e.button === 1) {
-    e.preventDefault();
-    pan = { x: e.clientX, y: e.clientY };
-    capturePointer(e.pointerId);
-    canvas.style.cursor = 'move';
-    return;
-  }
-  if (e.button === 2) {
-    if (!stroke && !studio.isDragging) startErase(e);
-    return;
-  }
-  if (e.button !== 0) return;
-  const resizeSide = studio.hitResizeHandle(e);
-  if (resizeSide) {
-    studio.startResize(resizeSide, e);
-    return;
-  }
-  hud.dismissHint();
-
-  const block = studio.pickBlock(e);
-  if (block && !stroke) {
-    dragPre = capture();
-    studio.beginDrag(block, e);
-    capturePointer(e.pointerId);
-    canvas.style.cursor = 'grabbing';
-    return;
-  }
-
-  const exact = studio.pointerToCellExact(e);
-  if (exact && !stroke) {
-    startPaint(e, exact);
-    return;
-  }
-
-  if (!stroke) {
-    orbit = { x: e.clientX, y: e.clientY };
-    capturePointer(e.pointerId);
-    canvas.style.cursor = 'grabbing';
-  }
-});
-
-canvas.addEventListener('pointermove', (e) => {
-  // 边缘拖拽中：手势归 Studio 的 window 监听，画布不再 hover / 绘制
-  if (studio.isResizing) return;
-  if (e.pointerType === 'touch' && touchPoints.has(e.pointerId)) {
-    touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (pinch && touchPoints.size >= 2) {
-      const next = pinchFromTouches();
-      if (next) {
-        studio.orbit(next.cx - pinch.cx, next.cy - pinch.cy);
-        if (Math.abs(next.dist - pinch.dist) > 2) studio.zoom((pinch.dist - next.dist) * 0.16);
-        pinch = next;
-      }
-      return;
-    }
-  }
-  studio.parallax(e);
-  if (studio.isDragging) {
-    studio.dragTo(e);
-    studio.setHover(studio.dragTargetCell(), false);
-    return;
-  }
-  if (pan) {
-    studio.pan(e.clientX - pan.x, e.clientY - pan.y);
-    pan = { x: e.clientX, y: e.clientY };
-    return;
-  }
-  if (orbit) {
-    studio.orbit(e.clientX - orbit.x, e.clientY - orbit.y);
-    orbit = { x: e.clientX, y: e.clientY };
-    return;
-  }
-  if (stroke) {
-    paintMove(e);
-    return;
-  }
-  updateHover(e);
-});
-
 /** 块拖动落定：动量、选格、交换、越界删除；返回是否删除 */
 function commitDrag(): { removed: boolean; drop: Cell | null } {
   const before = dragPre;
-  const drop = studio.dragTargetCell();
-  const { removed } = studio.endDrag();
+  const from = dragFrom;
+  const landed = studio.endDrag();
+  const { removed } = landed;
+  const drop = removed ? null : { step: landed.step, row: landed.row };
   const after = capture();
   if (before && (removed || !sameNotes(before.notes, after.notes))) history.push(before);
   dragPre = null;
+  dragFrom = null;
   audio.sfx(removed ? 'sfx_break' : 'sfx_place', 0, removed ? 0.95 : 0.85, removed ? 0.5 : 0.28);
   canvas.style.cursor = 'default';
   // 拖到窗口最右一列：松手后让出 4 列，像翻页
@@ -1040,36 +1283,243 @@ function commitDrag(): { removed: boolean; drop: Cell | null } {
   }
   syncLength();
   markDirty();
+  if (removed) {
+    clearSelection();
+  } else if (drop) {
+    const block = studio.blockAt(drop.step, drop.row);
+    if (block) selectNote({ step: block.step, row: block.row });
+    else if (from) clearSelection();
+  }
   return { removed, drop };
 }
 
-function endPointer(e: PointerEvent): void {
-  if (e.pointerType === 'touch') {
-    touchPoints.delete(e.pointerId);
-    if (touchPoints.size < 2) pinch = null;
-  }
-  if (studio.isResizing) return;
-  if (stroke) finishStroke();
-  if (studio.isDragging) commitDrag();
-  if (pan) {
-    pan = null;
-    canvas.style.cursor = 'default';
-  }
-  if (orbit) {
-    orbit = null;
-    canvas.style.cursor = 'default';
-  }
-  if (!stroke && !studio.isDragging && !orbit && !pan) updateHover(e);
+// ---------------------------------------------------------------- gestures
+
+const gestureHost: GestureHost = {
+  isBlocked: () =>
+    document.body.classList.contains('drawer-open') ||
+    (drawer?.isOpen ?? false) ||
+    (examplesDrawer?.isOpen ?? false) ||
+    (helpDrawer?.isOpen ?? false) ||
+    studio.isResizing,
+  hitResizeHandle: (e) => studio.hitResizeHandle(e),
+  startResize: (side, e) => studio.startResize(side, e),
+  pickBlock: (e) => {
+    const block = studio.pickBlock(e);
+    return block ? { step: block.step, row: block.row } : null;
+  },
+  cellAt: (e) => studio.pointerToCellExact(e),
+
+  notePointerDown: () => {
+    dragPre = capture();
+    dragFrom = null;
+    hud.dismissHint();
+  },
+  noteDragStart: (note, origin) => {
+    const block = studio.blockAt(note.step, note.row);
+    if (!block) return;
+    dragFrom = { step: note.step, row: note.row };
+    dragPre = capture();
+    studio.beginDrag(block, origin);
+  },
+  noteDragMove: (e) => {
+    studio.dragTo(e);
+    studio.setHover(studio.dragTargetCell(), false);
+  },
+  noteDragEnd: () => {
+    commitDrag();
+  },
+  noteDragCancel: () => {
+    studio.cancelDrag();
+    dragPre = null;
+    dragFrom = null;
+  },
+  noteSelect: (note) => selectNote(note),
+  backgroundClick: () => clearSelection(),
+
+  paintStart: (e, cell) => {
+    clearSelectionAfterStroke = clearSelectionAfterStroke || selected !== null;
+    startPaint(e, cell);
+  },
+  paintMove: (e) => strokeMove(e),
+  paintEnd: () => finishStroke(),
+  cancelStroke: () => cancelStroke(),
+
+  eraseStart: (e) => {
+    clearSelectionAfterStroke = clearSelectionAfterStroke || selected !== null;
+    startErase(e);
+  },
+  eraseMove: (e) => strokeMove(e),
+  eraseEnd: () => finishStroke(),
+
+  orbitMove: (dx, dy) => studio.orbit(dx, dy),
+  orbitEnd: () => {
+    hideReadout();
+  },
+  panMove: (dx, dy) => studio.pan(dx, dy),
+  panEnd: () => undefined,
+
+  twoFingerStart: (anchor) => {
+    hideReadout();
+    studio.setHover(null);
+    studio.beginPinch({ clientX: anchor.x, clientY: anchor.y });
+  },
+  twoFingerMove: (scale, cx, cy) =>
+    studio.updatePinch(scale, { clientX: cx, clientY: cy }),
+  twoFingerEnd: () => studio.endPinch(),
+
+  parallax: (e) => studio.parallax(e),
+  hover: (e) => updateHover(e),
+  leave: () => {
+    studio.pointerNearEdge(null);
+    hideReadout();
+    if (!studio.isDragging && !stroke) {
+      studio.setHover(null);
+      hoverBlock = null;
+    }
+  },
+  interaction: () => {
+    void unlock();
+    hud.dismissHint();
+    // 点击舞台后把焦点交给画布，页面快捷键不再被之前的按钮吞掉
+    canvas.focus({ preventScroll: true });
+  },
+  cursor: (kind) => {
+    canvas.style.cursor = kind;
+  },
+};
+
+gestures = new GestureController(canvas, gestureHost);
+gestures.attach();
+
+// ---------------------------------------------------------------- 键盘 / 滚轮
+
+function isTextEntry(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  return el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.tagName === 'INPUT';
 }
 
-canvas.addEventListener('pointerup', endPointer);
-canvas.addEventListener('pointercancel', endPointer);
-canvas.addEventListener('pointerleave', () => {
-  studio.pointerNearEdge(null);
-  if (!studio.isDragging && !stroke) {
-    studio.setHover(null);
-    hoverBlock = null;
+function isStageFocus(el: HTMLElement | null): boolean {
+  return !el || el === document.body || el === document.documentElement || el === canvas;
+}
+
+function anyDrawerOpen(): boolean {
+  return !!drawer?.isOpen || !!examplesDrawer?.isOpen || !!helpDrawer?.isOpen;
+}
+
+type PresetView = 'persp' | 'top' | 'front';
+const VIEW_CYCLE: PresetView[] = ['persp', 'top', 'front'];
+function nextView(): PresetView {
+  const current = studio.view as PresetView;
+  const index = VIEW_CYCLE.indexOf(current);
+  return VIEW_CYCLE[(index < 0 ? 0 : index + 1) % VIEW_CYCLE.length];
+}
+
+window.addEventListener('keydown', (e) => {
+  const el = e.target as HTMLElement | null;
+
+  if (e.key === 'Escape') {
+    if (studio.isResizing) {
+      e.preventDefault();
+      studio.cancelResize();
+      return;
+    }
+    if (gestures && gestures.modeName !== 'idle') {
+      e.preventDefault();
+      gestures.cancelAll();
+      return;
+    }
+    if (notePanel?.isOpen) {
+      e.preventDefault();
+      clearSelection();
+      return;
+    }
+    // 一次按键只关闭一层
+    if (anyDrawerOpen()) {
+      e.preventDefault();
+      if (helpDrawer?.isOpen) helpDrawer.hide();
+      else if (examplesDrawer?.isOpen) examplesDrawer.hide();
+      else if (drawer?.isOpen) drawer.hide();
+    }
+    return;
   }
+
+  // 抽屉打开时，页面快捷键不得修改背后的舞台
+  if (anyDrawerOpen()) return;
+
+  // 空格只服务舞台 / 页面背景；按钮、开关、输入保留原生语义
+  if (e.code === 'Space') {
+    if (!isStageFocus(el) || isTextEntry(el)) return;
+    e.preventDefault();
+    if (!e.repeat) togglePlay();
+    return;
+  }
+
+  if (isTextEntry(el)) return;
+  const mod = e.metaKey || e.ctrlKey;
+
+  if (mod && (e.key === 'z' || e.key === 'Z')) {
+    e.preventDefault();
+    if (e.shiftKey) redo();
+    else undo();
+    return;
+  }
+  if (mod && (e.key === 'y' || e.key === 'Y')) {
+    e.preventDefault();
+    redo();
+    return;
+  }
+  if (e.key === ',' || e.key === '，') {
+    e.preventDefault();
+    hud.onSettings?.();
+    return;
+  }
+  if (e.key === 'e' || e.key === 'E') {
+    e.preventDefault();
+    hud.onExamples?.();
+    return;
+  }
+  if (e.key === 'f' || e.key === 'F') {
+    e.preventDefault();
+    hud.onFitStage?.();
+    return;
+  }
+  if (e.key === '1' || e.key === '2' || e.key === '3') {
+    const id = e.key === '1' ? 'persp' : e.key === '2' ? 'top' : 'front';
+    hud.onView?.(id);
+  }
+  if (e.key === 'v' || e.key === 'V') hud.onView?.(nextView());
+  if (e.key === 'i' || e.key === 'I') toggleInfinite();
+  if (e.key === 'Home') {
+    e.preventDefault();
+    rewind();
+  }
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (selected) {
+      e.preventDefault();
+      deleteSelected();
+      return;
+    }
+    if (hoverBlock) {
+      e.preventDefault();
+      record();
+      audio.sfx('sfx_break', 0, 1, 0.5);
+      studio.removeBlock(hoverBlock.step, hoverBlock.row);
+      hoverBlock = null;
+      studio.setHover(null);
+      syncLength();
+      markDirty();
+    }
+  }
+});
+
+// 中键拖拽：压掉浏览器自带的自动滚动 / 粘贴行为
+canvas.addEventListener('mousedown', (e) => {
+  if (e.button === 1) e.preventDefault();
+});
+canvas.addEventListener('auxclick', (e) => {
+  if (e.button === 1) e.preventDefault();
 });
 
 canvas.addEventListener(
@@ -1085,6 +1535,10 @@ canvas.addEventListener(
         record(`pitch:${block.step}:${block.row}`);
         studio.setPitch(block.step, block.row, midi);
         audio.play(voice(block.row), midi, 0, 0.8);
+        if (selected && selected.step === block.step && selected.row === block.row) {
+          selected.midi = midi;
+          syncNotePanel();
+        }
         markDirty();
       }
       return;
@@ -1108,107 +1562,27 @@ canvas.addEventListener('contextmenu', (e) => {
   if (performance.now() < suppressContextUntil) return;
   const block = studio.pickBlock(e);
   if (!block) return;
+  const { step, row } = block;
   record();
   audio.sfx('sfx_break', 0, 1, 0.5);
-  studio.removeBlock(block.step, block.row);
+  studio.removeBlock(step, row);
   studio.setHover(null);
   hoverBlock = null;
+  if (selected && selected.step === step && selected.row === row) clearSelection();
   syncLength();
   markDirty();
 });
 
-type PresetView = 'persp' | 'top' | 'front';
-const VIEW_CYCLE: PresetView[] = ['persp', 'top', 'front'];
-function nextView(): PresetView {
-  const current = studio.view as PresetView;
-  const index = VIEW_CYCLE.indexOf(current);
-  return VIEW_CYCLE[(index < 0 ? 0 : index + 1) % VIEW_CYCLE.length];
-}
+// ---------------------------------------------------------------- 持久化兜底
 
-function isTextEntry(el: HTMLElement | null): boolean {
-  if (!el) return false;
-  if (el.isContentEditable) return true;
-  if (el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') return true;
-  if (el.tagName === 'INPUT') {
-    const type = (el as HTMLInputElement).type;
-    return !['number', 'range', 'button', 'checkbox', 'radio', 'color', 'file'].includes(type);
-  }
-  return false;
-}
-
-window.addEventListener('keydown', (e) => {
-  const el = e.target as HTMLElement | null;
-  // 空格只绑定播放/暂停：按钮、数字输入、滑杆、画布上一律生效；文字输入框放行
-  if (e.code === 'Space') {
-    if (isTextEntry(el)) return;
-    e.preventDefault();
-    if (!e.repeat) togglePlay();
-    return;
-  }
-  if (el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
-  const mod = e.metaKey || e.ctrlKey;
-
-  if (mod && (e.key === 'z' || e.key === 'Z')) {
-    e.preventDefault();
-    if (e.shiftKey) redo();
-    else undo();
-    return;
-  }
-  if (mod && (e.key === 'y' || e.key === 'Y')) {
-    e.preventDefault();
-    redo();
-    return;
-  }
-  if (e.key === ',' || e.key === '，') {
-    e.preventDefault();
-    drawer.toggle();
-    return;
-  }
-  if (e.key === 'e' || e.key === 'E') {
-    e.preventDefault();
-    drawer.hide();
-    examplesDrawer?.toggle();
-    return;
-  }
-  if (e.key === 'Escape') {
-    if (studio.isResizing) {
-      e.preventDefault();
-      studio.cancelResize();
-      return;
-    }
-    if (drawer.isOpen) {
-      e.preventDefault();
-      drawer.hide();
-      return;
-    }
-    if (examplesDrawer?.isOpen) {
-      e.preventDefault();
-      examplesDrawer.hide();
-      return;
-    }
-  }
-  if (e.key === '1' || e.key === '2' || e.key === '3') {
-    const id = e.key === '1' ? 'persp' : e.key === '2' ? 'top' : 'front';
-    hud.onView?.(id);
-  }
-  if (e.key === 'v' || e.key === 'V') hud.onView?.(nextView());
-  if (e.key === 'i' || e.key === 'I') toggleInfinite();
-  if (e.key === 'Home') {
-    e.preventDefault();
-    rewind();
-  }
-  if ((e.key === 'Delete' || e.key === 'Backspace') && hoverBlock) {
-    e.preventDefault();
-    record();
-    audio.sfx('sfx_break', 0, 1, 0.5);
-    studio.removeBlock(hoverBlock.step, hoverBlock.row);
-    hoverBlock = null;
-    syncLength();
-    markDirty();
-  }
+window.addEventListener('beforeunload', () => persistence.flush());
+window.addEventListener('pagehide', () => persistence.flush());
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'hidden') return;
+  // 半拖动 / 半清空不写入：先按统一规则取消，再提交最近完成的编辑
+  gestures?.cancelAll();
+  persistence.flush();
 });
-
-window.addEventListener('beforeunload', () => saveLocal(capture()));
 
 // ---------------------------------------------------------------- frame
 
@@ -1260,8 +1634,20 @@ Object.assign(window, {
   get __examplesDrawer() {
     return examplesDrawer;
   },
+  get __helpDrawer() {
+    return helpDrawer;
+  },
   get __examples() {
     return examplePanel;
+  },
+  get __gestures() {
+    return gestures;
+  },
+  get __viewport() {
+    return viewport;
+  },
+  get __notePanel() {
+    return notePanel;
   },
 });
 Object.assign(window, {
@@ -1278,6 +1664,19 @@ Object.assign(window, {
     setBars,
     setLoop,
     setWindowCols,
+    setBpmValue,
+    selectNote,
+    clearSelection,
+    deleteSelected,
+    shiftSelected,
+    previewSelected,
+    fitStage: () => studio.fitStage(),
+    save: () => {
+      const result = persistence.flush();
+      refreshSaveStatus();
+      return result;
+    },
+    saveSnapshot: () => persistence.snapshot,
     loadExample: (id: string) => {
       const example = EXAMPLES.find((e) => e.id === id);
       if (example) loadExample(example);
@@ -1288,8 +1687,13 @@ Object.assign(window, {
     hasBackup: () => hasBackup(),
     examples: EXAMPLES,
     openExamples: () => {
-      drawer.hide();
+      drawer?.hide();
       examplesDrawer?.show();
+    },
+    openHelp: () => {
+      drawer?.hide();
+      examplesDrawer?.hide();
+      helpDrawer?.show();
     },
     syncLength,
     decode: decodeSong,
@@ -1302,8 +1706,17 @@ Object.assign(window, {
     get loop() {
       return loop;
     },
+    get selected() {
+      return selected ? { ...selected } : null;
+    },
     get prefs() {
       return { ...prefs };
+    },
+    get mode() {
+      return document.body.dataset.mode;
+    },
+    get stageRect() {
+      return viewport?.rect ?? null;
     },
   },
 });

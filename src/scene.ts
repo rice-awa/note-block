@@ -201,7 +201,6 @@ export class Studio {
   private gridBold!: { lines: THREE.LineSegments; pos: Float32Array; attr: THREE.BufferAttribute };
   private wipeBand!: THREE.Group;
   private wipe = { active: false, t: 0, dur: 0.34 };
-  private dieQueue: Array<{ step: number; row: number; at: number }> = [];
 
   private caps!: THREE.InstancedMesh;
   private blobs!: THREE.InstancedMesh;
@@ -219,6 +218,16 @@ export class Studio {
   private ndc = new THREE.Vector2();
   private dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   private dragPoint = new THREE.Vector3();
+  private readonly tempCamera = new THREE.PerspectiveCamera();
+
+  /** 布局层量出的可用矩形：相机适配、投影、拾取共用这一套基准 */
+  private stageRect = { left: 0, top: 0, width: 1, height: 1 };
+  private stageRectSet = false;
+  private pinch: { dist0: number; anchorWorld: THREE.Vector3 | null } | null = null;
+  /** 正在播放销毁动画、但已经从曲谱数据里移除的方块 */
+  private dying: Array<{ block: BlockView; at: number }> = [];
+  private selection: Cell | null = null;
+  private hoverCell: Cell | null = null;
 
   private drag: {
     block: BlockView;
@@ -759,9 +768,20 @@ export class Studio {
     this.stepIndex.clear();
     this.maxStepValue = -1;
     this.maxStepDirty = false;
-    this.dieQueue.length = 0;
+    // 清空动画中的临时视觉对象也要释放：撤销/重做/载入后旧队列不能继续删东西
+    for (const item of this.dying) {
+      this.blockGroup.remove(item.block.mesh);
+      item.block.mesh.geometry.dispose();
+      item.block.mat.dispose();
+    }
+    this.dying.length = 0;
     this.wipe.active = false;
     if (this.wipeBand) this.wipeBand.visible = false;
+    this.drag = null;
+    this.selection = null;
+    this.hoverCell = null;
+    this.outline.visible = false;
+    this.ghost.visible = false;
   }
 
   // ---------------------------------------------------------------- song / window
@@ -899,27 +919,39 @@ export class Studio {
     this.gridBold.attr.needsUpdate = true;
   }
 
-  /** 一键清屏：波前从窗口左缘扫到右缘，方块被扫到时碎成体素。返回清掉的块数 */
+  /**
+   * 一键清屏：数据立刻提交为空，视觉销毁独立播放。
+   * 这样保存 / 撤销 / 历史读到的永远是「已清空」，而不是动画中间状态；
+   * 撤销恢复的方块也不会被旧动画队列二次删除。
+   */
   clearAnimated(): number {
     if (!this.blocks.size) return 0;
     if (this.wipe.active) return this.blocks.size;
     const count = this.blocks.size;
     this.drag = null;
     this.setHover(null);
+    this.setSelection(null);
     const reduced = prefersReducedMotion();
-    const queue: Array<{ step: number; row: number; at: number }> = [];
-    for (const b of this.blocks.values()) {
+    const queue: Array<{ block: BlockView; at: number }> = [];
+    for (const b of [...this.blocks.values()]) {
+      // 逻辑提交：立刻从曲谱数据与索引中移除
+      this.blocks.delete(this.key(b.step, b.row));
+      this.unindexBlock(b);
+      b.mesh.userData.block = null;
       b.dragging = false;
       b.sy.setTarget(BLOCK_Y);
       b.ss.setTarget(reduced ? 1 : 0.9);
       const rel = b.step - this.viewStart;
-      queue.push({ step: b.step, row: b.row, at: reduced ? 0 : clamp(0.05 + rel * 0.016, 0, 0.3) });
+      queue.push({ block: b, at: reduced ? 0 : clamp(0.05 + rel * 0.016, 0, 0.3) });
     }
+    this.maxStepValue = -1;
+    this.maxStepDirty = false;
     queue.sort((a, b) => a.at - b.at);
-    this.dieQueue = queue;
+    this.dying = queue;
     this.wipe = { active: !reduced, t: 0, dur: 0.34 };
     if (reduced) {
-      this.flushDieQueue(Infinity);
+      // reduced-motion 走同一数据提交路径，只省略视觉
+      this.flushDying(Infinity, false);
       this.wipe.active = false;
       this.wipeBand.visible = false;
     } else {
@@ -930,15 +962,15 @@ export class Studio {
     return count;
   }
 
-  private flushDieQueue(upTo: number): void {
-    while (this.dieQueue.length && this.dieQueue[0].at <= upTo) {
-      const item = this.dieQueue.shift()!;
-      const block = this.blockAt(item.step, item.row);
-      if (!block) continue;
+  private flushDying(upTo: number, dust: boolean): void {
+    while (this.dying.length && this.dying[0].at <= upTo) {
+      const item = this.dying.shift()!;
+      const { block } = item;
       const pos = block.mesh.position;
-      // reduced-motion 路径里 wipe.active 已为 false，不炸粒子
-      if (this.wipe.active) this.dust.spawn(pos.x, pos.y + 0.15, pos.z, ROWS[item.row].color, 6, 2.4);
-      this.removeBlock(item.step, item.row, 0);
+      if (dust) this.dust.spawn(pos.x, pos.y + 0.15, pos.z, ROWS[block.row].color, 6, 2.4);
+      this.blockGroup.remove(block.mesh);
+      block.mesh.geometry.dispose();
+      block.mat.dispose();
     }
   }
 
@@ -1048,13 +1080,17 @@ export class Studio {
     this.setNDC(e);
     this.raycaster.setFromCamera(this.ndc, this.camera);
     const hits = this.raycaster.intersectObjects(this.blockGroup.children, false);
-    if (!hits.length) return null;
-    return (hits[0].object.userData.block as BlockView) ?? null;
+    for (const hit of hits) {
+      // 清空动画中的方块已经从曲谱数据里移出，不能再次被拾取
+      const block = hit.object.userData.block as BlockView | null | undefined;
+      if (block) return block;
+    }
+    return null;
   }
 
   // ---------------------------------------------------------------- drag
 
-  beginDrag(block: BlockView, e: PointerEvent): void {
+  beginDrag(block: BlockView, e: ScreenPoint): void {
     const p = this.pointOnPlane(e, LIFT_Y + 0.2);
     if (!p) return;
     const localX = p.x + this.halfW + this.viewStart;
@@ -1097,9 +1133,9 @@ export class Studio {
   }
 
   /** 松手：动量投影 → 选格 → 速度继承吸附；丢到场外 = 删除 */
-  endDrag(): { removed: boolean } {
+  endDrag(): { removed: boolean; step: number; row: number } {
     const d = this.drag;
-    if (!d) return { removed: false };
+    if (!d) return { removed: false, step: -1, row: -1 };
     this.drag = null;
     const b = d.block;
     b.dragging = false;
@@ -1122,7 +1158,7 @@ export class Studio {
     if (outside) {
       const { step, row } = b;
       this.removeBlock(step, row, 10);
-      return { removed: true };
+      return { removed: true, step, row };
     }
 
     const step = clamp(rawStep, 0, this.stepLimit - 1);
@@ -1169,7 +1205,27 @@ export class Studio {
     b.sy.setTarget(BLOCK_Y, -1.2);
     b.glow = Math.max(b.glow, 0.25);
     b.mesh.position.y = BLOCK_Y;
-    return { removed: false };
+    return { removed: false, step: b.step, row: b.row };
+  }
+
+  /**
+   * 取消拖动：方块回到按下时的格心，不产生交换 / 删除 / 历史。
+   * 多指接管或 pointercancel 时使用；数据里的 step/row 在落定前从未改变。
+   */
+  cancelDrag(): void {
+    const d = this.drag;
+    if (!d) return;
+    this.drag = null;
+    const b = d.block;
+    b.dragging = false;
+    const x = cellX(b.step);
+    const z = cellZ(b.row);
+    b.mesh.position.set(x, BLOCK_Y, z);
+    b.sx.snap(x);
+    b.sz.snap(z);
+    b.sy.setTarget(BLOCK_Y);
+    b.tiltX = 0;
+    b.tiltZ = 0;
   }
 
   get isDragging(): boolean {
@@ -1495,7 +1551,23 @@ export class Studio {
 
   // ---------------------------------------------------------------- hover / play
 
+  setSelection(cell: Cell | null): void {
+    this.selection = cell ? { step: cell.step, row: cell.row } : null;
+    this.paintOutline();
+  }
+
+  get selectedCell(): Cell | null {
+    return this.selection ? { ...this.selection } : null;
+  }
+
   setHover(cell: Cell | null, showGhost = true): void {
+    this.hoverCell = cell ? { step: cell.step, row: cell.row } : null;
+    this.paintOutline(showGhost);
+  }
+
+  /** 悬停优先，其次是选中：两者共用一个线框，但幽灵只服务悬停 */
+  private paintOutline(showGhost = true): void {
+    const cell = this.hoverCell ?? this.selection;
     if (!cell) {
       this.ghost.visible = false;
       this.outline.visible = false;
@@ -1507,8 +1579,9 @@ export class Studio {
     this.outline.position.set(cellX(cell.step), occupied ? BLOCK_Y : 0.505, cellZ(cell.row));
     this.outline.scale.setScalar(occupied ? 1 : 0.99);
     // 俯视图看不到方块侧面，幽灵方块没有意义，只留选中框
-    this.ghost.visible = !occupied && showGhost && this.viewId !== 'top';
-    if (this.ghost.visible) {
+    this.ghost.visible =
+      !occupied && showGhost && !!this.hoverCell && this.viewId !== 'top';
+    if (this.ghost.visible && this.hoverCell) {
       this.ghost.position.set(cellX(cell.step), 0.5, cellZ(cell.row));
       this.ghostMat.map = this.blockTexture(cell.row);
       this.ghostMat.needsUpdate = true;
@@ -1552,6 +1625,33 @@ export class Studio {
     return this.viewId;
   }
 
+  /** QA：当前相机与目标状态（不参与业务逻辑） */
+  get cameraState(): {
+    az: number;
+    el: number;
+    dist: number;
+    taz: number;
+    tel: number;
+    tdist: number;
+    panX: number;
+    panZ: number;
+    tpanX: number;
+    tpanZ: number;
+  } {
+    return {
+      az: this.cam.az,
+      el: this.cam.el,
+      dist: this.cam.dist,
+      taz: this.cam.taz,
+      tel: this.cam.tel,
+      tdist: this.cam.tdist,
+      panX: this.cam.panX,
+      panZ: this.cam.panZ,
+      tpanX: this.cam.tpanX,
+      tpanZ: this.cam.tpanZ,
+    };
+  }
+
   setView(id: Exclude<ViewId, 'free'>): void {
     this.applyPreset(id, true);
   }
@@ -1584,16 +1684,7 @@ export class Studio {
    * apply=false（自由状态）只更新缩放范围，不抢用户机位。
    */
   private fitView(apply = true): void {
-    const dist = fitDistance({
-      az: this.cam.taz,
-      el: this.cam.tel,
-      fov: this.cam.tfov,
-      aspect: this.camera.aspect,
-      lookY: this.cam.tlookY,
-      halfW: this.halfW + STAGE_HALF_W_PAD,
-      halfD: STAGE_HALF_D,
-      topY: STAGE_TOP_Y,
-    });
+    const dist = this.fitDistanceNow();
     if (this.viewId === 'free') {
       // 自由状态保留用户放大的范围，只保证新宽度也装得下
       this.zoomMin = Math.min(16, dist * 0.62);
@@ -1604,6 +1695,170 @@ export class Studio {
     if (apply) this.cam.tdist = dist;
     this.zoomMin = dist * 0.62;
     this.zoomMax = dist * 1.55;
+  }
+
+  /**
+   * 用有效视口（而不是整块 canvas）求相机距离：
+   * 通过 camera.setViewOffset 把舞台中心挪到可用矩形中心，
+   * 渲染、投影、raycast 仍然共用同一个投影矩阵，所以拾取不会偏。
+   */
+  private fitDistanceNow(): number {
+    const w = this.canvas.clientWidth || 1;
+    const h = this.canvas.clientHeight || 1;
+    const rect = this.stageRectSet ? this.stageRect : { left: 0, top: 0, width: w, height: h };
+    const aspect = Math.max(0.2, rect.width / Math.max(1, rect.height));
+    // 有效矩形只占画布一部分时，同样的世界尺寸要占更多屏幕像素 → 距离按比例放大
+    const scale = Math.max(1, h / Math.max(1, rect.height));
+    return fitDistance({
+      az: this.cam.taz,
+      el: this.cam.tel,
+      fov: this.cam.tfov,
+      aspect,
+      lookY: this.cam.tlookY,
+      halfW: this.halfW + STAGE_HALF_W_PAD,
+      halfD: STAGE_HALF_D,
+      topY: STAGE_TOP_Y,
+      margin: 1.06 * scale,
+    });
+  }
+
+  /** 布局层量出的可用矩形；变化时重新构图（自由相机只约束距离，不抢角度） */
+  setStageRect(rect: { left: number; top: number; width: number; height: number }): void {
+    const next = {
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+      width: Math.max(1, Math.round(rect.width)),
+      height: Math.max(1, Math.round(rect.height)),
+    };
+    const same =
+      this.stageRectSet &&
+      next.left === this.stageRect.left &&
+      next.top === this.stageRect.top &&
+      next.width === this.stageRect.width &&
+      next.height === this.stageRect.height;
+    this.stageRect = next;
+    this.stageRectSet = true;
+    this.applyViewOffset();
+    if (same) return;
+    if (this.viewId === 'free') this.fitView(false);
+    else this.applyPreset(this.viewId, false);
+  }
+
+  private applyViewOffset(): void {
+    const w = this.canvas.clientWidth || (typeof window !== 'undefined' ? window.innerWidth : 1) || 1;
+    const h = this.canvas.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 1) || 1;
+    const r = this.stageRectSet ? this.stageRect : { left: 0, top: 0, width: w, height: h };
+    const dx = r.left + r.width / 2 - w / 2;
+    const dy = r.top + r.height / 2 - h / 2;
+    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+      this.camera.clearViewOffset();
+    } else {
+      this.camera.setViewOffset(w, h, -dx, -dy, w, h);
+    }
+  }
+
+  /** 「适配舞台」：回到当前视角的完整构图，不改曲谱、播放位置或历史 */
+  fitStage(): void {
+    this.cam.tpanX = 0;
+    this.cam.tpanZ = 0;
+    if (this.viewId === 'free') {
+      const dist = this.fitDistanceNow();
+      this.zoomMin = Math.min(16, dist * 0.62);
+      this.zoomMax = Math.max(72, dist * 1.55);
+      this.cam.tdist = clamp(dist, this.zoomMin, this.zoomMax);
+      return;
+    }
+    this.applyPreset(this.viewId, false);
+  }
+
+  // ---------------------------------------------------------------- 双指相机
+
+  /** 双指开始：以当前目标机位与屏幕中心对应的舞台点为基准 */
+  beginPinch(anchor: ScreenPoint): void {
+    this.markFree();
+    const world = this.pointOnPlane(anchor, 0);
+    this.pinch = {
+      dist0: this.cam.tdist,
+      anchorWorld: world ? world.clone() : null,
+    };
+  }
+
+  /**
+   * scale = 当前两指距离 / 起始距离。缩放按绝对比例计算，不受事件频率影响；
+   * 同时把起始锚点留在当前双指中心，实现「边平移边缩放」。
+   */
+  updatePinch(scale: number, anchor: ScreenPoint): void {
+    const p = this.pinch;
+    if (!p) return;
+    this.markFree();
+    this.cam.tdist = clamp(p.dist0 / Math.max(0.2, scale), this.zoomMin, this.zoomMax);
+    if (!p.anchorWorld) return;
+    // 透视下平移与投影近似线性，迭代两次足够收敛到亚像素
+    for (let i = 0; i < 2; i++) {
+      const projected = this.projectWithTargets(p.anchorWorld);
+      const dx = anchor.clientX - projected.x;
+      const dy = anchor.clientY - projected.y;
+      if (Math.abs(dx) < 0.25 && Math.abs(dy) < 0.25) break;
+      this.panTargetByScreen(dx, dy);
+    }
+  }
+
+  endPinch(): void {
+    this.pinch = null;
+  }
+
+  /** 用「目标机位」投影世界点，避免阻尼让锚点补偿滞后 */
+  private projectWithTargets(point: THREE.Vector3): { x: number; y: number } {
+    const cam = this.tempCamera;
+    // 与渲染相机保持同一套视差 / 空闲漂移，否则锚点补偿会多推一段
+    const drift = this.viewId === 'persp' || this.viewId === 'free' ? Math.sin(this.elapsed * 0.16) * 0.006 : 0;
+    const az = this.cam.taz + this.cam.px * 0.055 * this.cam.parallax + drift;
+    const el = this.cam.tel + this.cam.py * 0.03 * this.cam.parallax;
+    const r = this.cam.tdist;
+    cam.fov = this.cam.tfov;
+    cam.aspect = this.camera.aspect;
+    cam.near = this.camera.near;
+    cam.far = this.camera.far;
+    cam.position.set(
+      this.cam.tpanX + Math.cos(el) * Math.sin(az) * r,
+      this.cam.tlookY + Math.sin(el) * r,
+      this.cam.tpanZ + Math.cos(el) * Math.cos(az) * r,
+    );
+    cam.lookAt(this.cam.tpanX, this.cam.tlookY, this.cam.tpanZ);
+    cam.updateMatrixWorld();
+    // 主相机的投影矩阵包含 view offset，直接复用
+    cam.projectionMatrix.copy(this.camera.projectionMatrix);
+    cam.projectionMatrixInverse.copy(this.camera.projectionMatrixInverse);
+    const v = point.clone().project(cam);
+    const rect = this.canvas.getBoundingClientRect();
+    return {
+      x: rect.left + (v.x * 0.5 + 0.5) * rect.width,
+      y: rect.top + (-v.y * 0.5 + 0.5) * rect.height,
+    };
+  }
+
+  /** 按屏幕位移平移相机目标（与 pan() 同一套方向约定，但使用目标机位） */
+  private panTargetByScreen(dx: number, dy: number): void {
+    const height = Math.max(1, this.canvas.clientHeight);
+    const k = (2 * this.cam.tdist * Math.tan((this.cam.tfov * Math.PI) / 360)) / height;
+    const az = this.cam.taz;
+    const rightX = Math.cos(az);
+    const rightZ = -Math.sin(az);
+    const sinEl = Math.max(0.35, Math.sin(this.cam.tel));
+    const upX = Math.sin(az);
+    const upZ = Math.cos(az);
+    const limitX = this.halfW + 8;
+    const limitZ = STAGE_HALF_D + 4;
+    this.cam.tpanX = clamp(
+      this.cam.tpanX - rightX * dx * k - (upX * dy * k) / sinEl,
+      -limitX,
+      limitX,
+    );
+    this.cam.tpanZ = clamp(
+      this.cam.tpanZ - rightZ * dx * k - (upZ * dy * k) / sinEl,
+      -limitZ,
+      limitZ,
+    );
   }
 
   orbit(dx: number, dy: number): void {
@@ -1656,10 +1911,11 @@ export class Studio {
     const h = this.canvas.clientHeight || window.innerHeight;
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
+    this.applyViewOffset();
     this.portrait = this.camera.aspect < 0.82;
     // 自由状态不抢用户的机位；预设状态则按新的窗口比例重新构图
     if (this.viewId !== 'free') this.applyPreset(this.viewId, false);
+    else this.fitView(false);
   }
 
   // ---------------------------------------------------------------- frame
@@ -1680,6 +1936,11 @@ export class Studio {
         b.mesh.visible = true;
         this.visibleBlocks.push(b);
       }
+    }
+    // 清空动画中的方块已不在 stepIndex，但仍要参与本帧的弹簧与渲染
+    for (const item of this.dying) {
+      item.block.mesh.visible = true;
+      this.visibleBlocks.push(item.block);
     }
   }
 
@@ -1731,9 +1992,9 @@ export class Studio {
       const progress = clamp(this.wipe.t / this.wipe.dur, 0, 1);
       this.wipeBand.position.x = -this.halfW - 0.8 + (this.windowColsValue + 1.6) * progress;
       this.setWipeOpacity(Math.sin(Math.PI * progress));
-      this.flushDieQueue(this.wipe.t);
+      this.flushDying(this.wipe.t, true);
       if (progress >= 1) {
-        this.flushDieQueue(Infinity);
+        this.flushDying(Infinity, true);
         this.wipe.active = false;
         this.wipeBand.visible = false;
       }

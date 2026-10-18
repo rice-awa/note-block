@@ -334,6 +334,24 @@ function getStorage(): Storage | null {
   }
 }
 
+/** 写入失败的类别：只暴露可判别的结果，不把异常对象丢给 UI */
+export type SaveFailure = 'unavailable' | 'quota' | 'unknown';
+export type SaveResult = { ok: true } | { ok: false; reason: SaveFailure };
+
+const OK: SaveResult = { ok: true };
+
+function failReason(err: unknown): SaveFailure {
+  if (!err || typeof err !== 'object') return 'unknown';
+  const e = err as { name?: unknown; code?: unknown };
+  const name = typeof e.name === 'string' ? e.name : '';
+  const code = typeof e.code === 'number' ? e.code : 0;
+  if (name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED' || code === 22 || code === 1014) {
+    return 'quota';
+  }
+  if (name === 'SecurityError' || name === 'NotAllowedError') return 'unavailable';
+  return 'unknown';
+}
+
 /** 读取本地存档：兼容 v1/v2/v3；旧版本按内容补 bars、loop 默认开 */
 export function loadLocal(): SongState | null {
   try {
@@ -362,14 +380,24 @@ export function loadLocal(): SongState | null {
   }
 }
 
-/** 写入本地存档（v3）；隐私模式、配额满等失败一律静默 */
-export function saveLocal(state: SongState): void {
+/** 写入本地存档（v3）；隐私模式、配额满等返回失败结果，由保存协调器展示 */
+export function saveLocal(state: SongState): SaveResult {
   try {
     const store = getStorage();
-    if (!store) return;
+    if (!store) return { ok: false, reason: 'unavailable' };
     store.setItem(STORAGE_KEY, JSON.stringify({ v: VERSION, ...normalizeState(state) }));
+    return OK;
+  } catch (err) {
+    return { ok: false, reason: failReason(err) };
+  }
+}
+
+/** 存储是否可读写：启动时用于区分「没有存档」与「读不到存档」 */
+export function storageAvailable(): boolean {
+  try {
+    return !!getStorage();
   } catch {
-    /* 静默失败，不打断演奏 */
+    return false;
   }
 }
 
@@ -394,11 +422,11 @@ export interface Backup {
   label: string;
 }
 
-/** 写入备份槽：只保留最近一份 */
-export function saveBackup(state: SongState, label: string): void {
+/** 写入备份槽：只保留最近一份；失败时 UI 必须提示「刷新后无法恢复」 */
+export function saveBackup(state: SongState, label: string): SaveResult {
   try {
     const store = getStorage();
-    if (!store) return;
+    if (!store) return { ok: false, reason: 'unavailable' };
     const payload = {
       v: VERSION,
       at: Date.now(),
@@ -406,8 +434,9 @@ export function saveBackup(state: SongState, label: string): void {
       state: normalizeState(state),
     };
     store.setItem(BACKUP_KEY, JSON.stringify(payload));
-  } catch {
-    /* 静默失败，不打断演奏 */
+    return OK;
+  } catch (err) {
+    return { ok: false, reason: failReason(err) };
   }
 }
 
@@ -462,6 +491,8 @@ export class History {
   private redoStack: SongState[] = [];
   private lastKey: string | null = null;
   private lastAt = 0;
+  /** push / undo / redo / clear 后统一通知 UI 更新撤销/重做按钮 */
+  onChange: (() => void) | null = null;
 
   constructor(limit: number = 40, noteBudget: number = 50_000) {
     this.limit = Math.max(1, Math.floor(limit) || 40);
@@ -500,25 +531,34 @@ export class History {
     this.undoStack.push(copyState(state));
     this.trim();
     this.resetCoalesce();
+    this.onChange?.();
   }
 
   /** 撤销：弹出上一份快照，当前状态进 redo */
   undo(current: SongState): SongState | null {
     const prev = this.undoStack.pop();
-    if (!prev) return null;
+    if (!prev) {
+      this.onChange?.();
+      return null;
+    }
     this.redoStack.push(copyState(current));
     this.trim();
     this.resetCoalesce();
+    this.onChange?.();
     return copyState(prev);
   }
 
   /** 重做：弹出 redo，当前状态回填 undo */
   redo(current: SongState): SongState | null {
     const next = this.redoStack.pop();
-    if (!next) return null;
+    if (!next) {
+      this.onChange?.();
+      return null;
+    }
     this.undoStack.push(copyState(current));
     this.trim();
     this.resetCoalesce();
+    this.onChange?.();
     return copyState(next);
   }
 
@@ -541,6 +581,7 @@ export class History {
     this.undoStack.length = 0;
     this.redoStack.length = 0;
     this.resetCoalesce();
+    this.onChange?.();
   }
 
   private resetCoalesce(): void {

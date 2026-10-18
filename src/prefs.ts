@@ -10,6 +10,8 @@ export interface Prefs {
   reverb: number;
   /** 可见列数 8..32（M4 才真正应用） */
   windowCols: number;
+  /** 首次玩法提示是否已经收起（独立偏好，存储失败也不反复打断） */
+  helpSeen: boolean;
 }
 
 export const PREFS_KEY = 'note-block:prefs:v1';
@@ -18,6 +20,7 @@ export const DEFAULT_PREFS: Prefs = {
   masterGain: 0.82,
   reverb: 0.16,
   windowCols: 16,
+  helpSeen: false,
 };
 
 export const WINDOW_COLS_MIN = 8;
@@ -55,6 +58,7 @@ export function loadPrefs(): Prefs {
       masterGain: clamp01(obj.masterGain, DEFAULT_PREFS.masterGain),
       reverb: clamp01(obj.reverb, DEFAULT_PREFS.reverb),
       windowCols: clampWindowCols(typeof obj.windowCols === 'number' ? obj.windowCols : DEFAULT_PREFS.windowCols),
+      helpSeen: obj.helpSeen === true,
     };
   } catch {
     return { ...DEFAULT_PREFS };

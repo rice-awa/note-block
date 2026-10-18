@@ -4,6 +4,7 @@
  */
 
 import { formatDuration, stepsDuration } from './song';
+import type { SaveStatus } from './persistence';
 
 export type GesturePhase = 'start' | 'move' | 'end';
 
@@ -20,6 +21,7 @@ export interface ConfigSnapshot {
   lengthSteps: number;
   /** 备份槽里是否有可恢复的作品 */
   canRestore: boolean;
+  saveStatus: SaveStatus;
 }
 
 export interface ConfigHandlers {
@@ -34,6 +36,7 @@ export interface ConfigHandlers {
   share(): void;
   restore(): void;
   clear(): void;
+  retrySave(): void;
 }
 
 type SliderKind = 'bpm' | 'master' | 'reverb';
@@ -76,6 +79,7 @@ export class ConfigPanel {
   private readonly reverbNum = el('input', 'cfg-num cfg-num--input');
   private readonly reverbOut = numBox(this.reverbNum, '%');
   private readonly autosave = el('p', 'cfg-note', '自动存档 · 刚刚');
+  private readonly retrySaveBtn = el('button', 'cfg-btn', '重试保存');
   private readonly shareBtn = el('button', 'cfg-btn', '复制分享链接');
   private readonly restoreBtn = el('button', 'cfg-btn', '恢复上次载入前的作品');
   private readonly clearBtn = el('button', 'cfg-btn cfg-btn--danger', '清空舞台');
@@ -99,6 +103,7 @@ export class ConfigPanel {
     reverb: 0.16,
     lengthSteps: 16,
     canRestore: false,
+    saveStatus: 'local',
   };
   private gesture: SliderKind | null = null;
   /** 滑杆原生 input → 视觉外壳（轨道 + 缓动滑块） */
@@ -114,6 +119,7 @@ export class ConfigPanel {
     this.masterNum.id = 'cfg-master-out';
     this.reverbNum.id = 'cfg-reverb-out';
     this.autosave.id = 'cfg-autosave';
+    this.retrySaveBtn.id = 'cfg-retry-save';
     this.shareBtn.id = 'cfg-share';
     this.restoreBtn.id = 'cfg-restore';
     this.clearBtn.id = 'cfg-clear';
@@ -159,6 +165,7 @@ export class ConfigPanel {
       ]),
       this.section('数据', [
         this.autosave,
+        this.retrySaveBtn,
         this.shareBtn,
         this.restoreBtn,
         this.clearBtn,
@@ -171,8 +178,14 @@ export class ConfigPanel {
     this.bindSwitch(this.loopSwitch, () => this.handlers.loop(!this.snapshot.loop));
     this.bindSwitch(this.infiniteSwitch, () => this.handlers.infinite(!this.snapshot.infinite));
     this.shareBtn.addEventListener('click', () => this.handlers.share());
+    this.retrySaveBtn.addEventListener('click', () => this.handlers.retrySave());
     this.restoreBtn.addEventListener('click', () => this.handlers.restore());
     this.clearBtn.addEventListener('click', () => this.handlers.clear());
+    this.barsInput.setAttribute('aria-label', '曲长小节数');
+    this.windowInput.setAttribute('aria-label', '可见列数');
+    this.bpmOut.setAttribute('aria-label', 'BPM 数值');
+    this.masterNum.setAttribute('aria-label', '主音量百分比');
+    this.reverbNum.setAttribute('aria-label', '混响百分比');
     this.bindNumber(this.barsInput, 1, 32, 1, (value) => this.handlers.barsValue(value));
     this.bindNumber(this.windowInput, 8, 32, 4, (value) => this.handlers.windowCols(value));
     this.bindNumber(this.bpmOut, 60, 180, 1, (value) => {
@@ -232,11 +245,14 @@ export class ConfigPanel {
     this.clearBtn.setAttribute('aria-label', next.notes === 0 ? '舞台已经是空的' : '清空舞台');
     this.restoreBtn.disabled = !next.canRestore;
     this.restoreBtn.setAttribute('aria-label', next.canRestore ? '恢复上次载入前的作品' : '没有可恢复的作品');
+    this.retrySaveBtn.disabled = next.saveStatus !== 'failed';
   }
 
-  /** 数据区的自动存档读数 */
-  setSavedLabel(text: string): void {
+  /** 数据区的保存状态：失败时保留明确状态并允许重试 */
+  setSaveState(status: SaveStatus, text: string): void {
     this.autosave.textContent = text;
+    this.autosave.classList.toggle('is-failed', status === 'failed');
+    this.retrySaveBtn.disabled = status !== 'failed';
   }
 
   private section(title: string, children: HTMLElement[]): HTMLElement {

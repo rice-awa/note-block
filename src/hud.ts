@@ -1,13 +1,36 @@
 import { ROWS } from './rows';
 import { formatDuration } from './song';
+import type { SaveStatus } from './persistence';
 import type { ViewId } from './views';
+
+export type FeedbackTarget = 'page' | 'settings' | 'examples';
+
+interface FeedbackSlot {
+  root: HTMLElement;
+  text: HTMLElement;
+  action: HTMLButtonElement;
+}
+
+interface ActiveFeedback {
+  target: FeedbackTarget;
+  text: string;
+  actionLabel: string | null;
+  handler: (() => void) | null;
+  ttl: number;
+  remaining: number;
+  startedAt: number;
+  timer: number;
+  paused: boolean;
+}
 
 export class Hud {
   onPlay: (() => void) | null = null;
   onBpm: ((delta: number) => void) | null = null;
+  onBpmValue: ((value: number) => void) | null = null;
   onMuteRow: ((row: number) => void) | null = null;
   onSound: (() => void) | null = null;
   onView: ((id: Exclude<ViewId, 'free'>) => void) | null = null;
+  onFitStage: (() => void) | null = null;
   onInfinite: (() => void) | null = null;
   onClear: (() => void) | null = null;
   onShare: (() => void) | null = null;
@@ -18,19 +41,45 @@ export class Hud {
   onRewind: (() => void) | null = null;
   onSettings: (() => void) | null = null;
   onExamples: (() => void) | null = null;
+  onHelp: (() => void) | null = null;
+  onUndo: (() => void) | null = null;
+  onRedo: (() => void) | null = null;
+  onRowsToggle: ((open: boolean) => void) | null = null;
+  onHintDismiss: (() => void) | null = null;
+  onRetrySave: (() => void) | null = null;
 
   private playBtn = document.querySelector<HTMLButtonElement>('#play')!;
   private rewindBtn = document.querySelector<HTMLButtonElement>('#rewind')!;
-  private bpmEl = document.querySelector<HTMLElement>('#bpm')!;
+  private undoBtn = document.querySelector<HTMLButtonElement>('#undo')!;
+  private redoBtn = document.querySelector<HTMLButtonElement>('#redo')!;
+  private bpmEl = document.querySelector<HTMLButtonElement>('#bpm')!;
+  private bpmInput = document.querySelector<HTMLInputElement>('#bpm-input')!;
   private stepsEl = document.querySelector<HTMLElement>('#steps')!;
   private rowsEl = document.querySelector<HTMLElement>('#rows')!;
+  private rowsWrap = document.querySelector<HTMLElement>('#rows-wrap')!;
+  private rowsToggle = document.querySelector<HTMLButtonElement>('#rows-toggle')!;
+  private rowsToggleText = document.querySelector<HTMLElement>('#rows-toggle-text')!;
   private hintEl = document.querySelector<HTMLElement>('#hint')!;
+  private hintClose = document.querySelector<HTMLButtonElement>('#hint-close')!;
+  private emptyHint = document.querySelector<HTMLElement>('#empty-hint')!;
+  private emptyExamples = document.querySelector<HTMLButtonElement>('#empty-examples')!;
   private soundBtn = document.querySelector<HTMLButtonElement>('#sound')!;
   private infiniteBtn = document.querySelector<HTMLButtonElement>('#infinite')!;
   private clearBtn = document.querySelector<HTMLButtonElement>('#clear')!;
   private shareBtn = document.querySelector<HTMLButtonElement>('#share')!;
   private settingsBtn = document.querySelector<HTMLButtonElement>('#settings')!;
   private examplesBtn = document.querySelector<HTMLButtonElement>('#examples')!;
+  private helpBtn = document.querySelector<HTMLButtonElement>('#help')!;
+  private moreBtn = document.querySelector<HTMLButtonElement>('#more')!;
+  private viewMenuBtn = document.querySelector<HTMLButtonElement>('#view-menu-btn')!;
+  private fitStageBtn = document.querySelector<HTMLButtonElement>('#fit-stage')!;
+  private viewMenu = document.querySelector<HTMLElement>('#view-menu')!;
+  private viewFit = document.querySelector<HTMLButtonElement>('#view-fit')!;
+  private moreMenu = document.querySelector<HTMLElement>('#more-menu')!;
+  private moreInfinite = document.querySelector<HTMLButtonElement>('[data-more="infinite"]')!;
+  private moreClear = document.querySelector<HTMLButtonElement>('[data-more="clear"]')!;
+  private saveStatus = document.querySelector<HTMLButtonElement>('#save-status')!;
+  private saveStatusText = document.querySelector<HTMLElement>('#save-status .save-status-text')!;
   private measureEl = document.querySelector<HTMLElement>('#measure')!;
   private barsEl = document.querySelector<HTMLElement>('#bars')!;
   private rail = document.querySelector<HTMLElement>('#rail')!;
@@ -40,14 +89,30 @@ export class Hud {
   private railTip = document.querySelector<HTMLElement>('#railTip')!;
   private railNow = document.querySelector<HTMLElement>('#railNow')!;
   private railEnd = document.querySelector<HTMLElement>('#railEnd')!;
-  private toastEl = document.querySelector<HTMLElement>('#toast')!;
-  private toastText = document.querySelector<HTMLElement>('#toast-text')!;
-  private toastAction = document.querySelector<HTMLButtonElement>('#toast-action')!;
+
+  private readonly slots: Record<FeedbackTarget, FeedbackSlot> = {
+    page: {
+      root: document.querySelector<HTMLElement>('#toast')!,
+      text: document.querySelector<HTMLElement>('#toast-text')!,
+      action: document.querySelector<HTMLButtonElement>('#toast-action')!,
+    },
+    settings: {
+      root: document.querySelector<HTMLElement>('#settings-feedback')!,
+      text: document.querySelector<HTMLElement>('#settings-feedback .drawer-feedback-text')!,
+      action: document.querySelector<HTMLButtonElement>('#settings-feedback .drawer-feedback-action')!,
+    },
+    examples: {
+      root: document.querySelector<HTMLElement>('#examples-feedback')!,
+      text: document.querySelector<HTMLElement>('#examples-feedback .drawer-feedback-text')!,
+      action: document.querySelector<HTMLButtonElement>('#examples-feedback .drawer-feedback-action')!,
+    },
+  };
 
   private viewBtns: HTMLButtonElement[] = [];
   private stepDots: HTMLElement[] = [];
   private rowItems: HTMLButtonElement[] = [];
   private hintGone = false;
+  private mutedRows = 0;
 
   private length = 16;
   private position = 0;
@@ -56,35 +121,53 @@ export class Hud {
   private endText = '';
   private atEnd = false;
   private measureIndex = 0;
-  private toastTimer = 0;
-  private toastHandler: (() => void) | null = null;
   private railScrubbing = false;
+  private feedback: ActiveFeedback | null = null;
+  private openMenu: HTMLElement | null = null;
+  private menuTrigger: HTMLElement | null = null;
 
   constructor() {
     this.buildRows();
     this.buildSteps();
     this.playBtn.addEventListener('click', () => this.onPlay?.());
     this.rewindBtn.addEventListener('click', () => this.onRewind?.());
+    this.undoBtn.addEventListener('click', () => this.onUndo?.());
+    this.redoBtn.addEventListener('click', () => this.onRedo?.());
     this.soundBtn.addEventListener('click', () => this.onSound?.());
     this.infiniteBtn.addEventListener('click', () => this.onInfinite?.());
     this.clearBtn.addEventListener('click', () => this.onClear?.());
     this.shareBtn.addEventListener('click', () => this.onShare?.());
     this.settingsBtn.addEventListener('click', () => this.onSettings?.());
     this.examplesBtn.addEventListener('click', () => this.onExamples?.());
+    this.helpBtn.addEventListener('click', () => this.onHelp?.());
+    this.fitStageBtn.addEventListener('click', () => this.onFitStage?.());
+    this.emptyExamples.addEventListener('click', () => this.onExamples?.());
+    this.hintClose.addEventListener('click', () => this.dismissHint());
+    this.saveStatus.addEventListener('click', () => this.onRetrySave?.());
+
     document.querySelectorAll<HTMLButtonElement>('[data-bpm]').forEach((btn) => {
       btn.addEventListener('click', () => this.onBpm?.(Number(btn.dataset.bpm)));
     });
     document.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((btn) => {
       this.viewBtns.push(btn);
-      btn.addEventListener('click', () => this.onView?.(btn.dataset.view as Exclude<ViewId, 'free'>));
+      btn.addEventListener('click', () => {
+        this.closeMenus();
+        this.onView?.(btn.dataset.view as Exclude<ViewId, 'free'>);
+      });
     });
-    this.toastAction.addEventListener('click', () => {
-      const handler = this.toastHandler;
-      this.hideToast();
-      handler?.();
+    document.querySelectorAll<HTMLButtonElement>('[data-more]').forEach((btn) => {
+      btn.addEventListener('click', () => this.runMore(btn.dataset.more ?? ''));
     });
+    this.bindBpmEditor();
+    this.bindMenus();
+    this.bindRowsToggle();
+    this.bindFeedback(this.slots.page);
+    this.bindFeedback(this.slots.settings);
+    this.bindFeedback(this.slots.examples);
     this.bindRail();
   }
+
+  // ---------------------------------------------------------------- 构建
 
   private buildRows(): void {
     this.rowsEl.innerHTML = '';
@@ -94,17 +177,26 @@ export class Hud {
       li.className = 'row-item';
       li.dataset.row = String(i);
       li.setAttribute('aria-pressed', 'false');
+      li.setAttribute('aria-label', `${row.label} ${row.voice}，点击静音`);
       li.innerHTML =
         `<span class="row-swatch" style="background-image:url('/tex/${row.tex}.png')"></span>` +
-        `<span class="row-text"><span class="row-name">${row.label}</span><span class="row-voice">${row.voice}</span></span>`;
+        `<span class="row-text"><span class="row-name">${row.label}</span><span class="row-voice">${row.voice}</span></span>` +
+        `<span class="row-mute">静音</span>`;
       li.addEventListener('click', () => {
         const muted = li.classList.toggle('muted');
         li.setAttribute('aria-pressed', String(muted));
+        li.setAttribute(
+          'aria-label',
+          `${row.label} ${row.voice}，${muted ? '已静音，点击取消静音' : '点击静音'}`,
+        );
+        this.mutedRows += muted ? 1 : -1;
+        this.setRowsMuted(this.mutedRows);
         this.onMuteRow?.(i);
       });
       this.rowsEl.appendChild(li);
       this.rowItems.push(li);
     });
+    this.setRowsMuted(0);
   }
 
   private buildSteps(): void {
@@ -119,6 +211,137 @@ export class Hud {
       this.stepDots.push(dot);
     }
   }
+
+  private bindRowsToggle(): void {
+    this.rowsToggle.addEventListener('click', () => {
+      const open = !this.rowsWrap.classList.contains('is-open');
+      this.setRowsOpen(open);
+      this.onRowsToggle?.(open);
+    });
+  }
+
+  setRowsOpen(open: boolean): void {
+    this.rowsWrap.classList.toggle('is-open', open);
+    this.rowsToggle.setAttribute('aria-expanded', String(open));
+    document.body.classList.toggle('rows-open', open);
+  }
+
+  private setRowsMuted(muted: number): void {
+    this.mutedRows = Math.max(0, Math.min(ROWS.length, muted));
+    const on = ROWS.length - this.mutedRows;
+    this.rowsToggleText.textContent = `音色 · ${on}/${ROWS.length} 开启`;
+    this.rowsHoldState();
+  }
+
+  private rowsHoldState(): void {
+    this.rowsToggle.classList.toggle('has-muted', this.mutedRows > 0);
+  }
+
+  // ---------------------------------------------------------------- BPM 就地编辑
+
+  private bindBpmEditor(): void {
+    this.bpmEl.addEventListener('click', () => this.openBpmEditor());
+    const commit = (): void => {
+      if (this.bpmInput.hidden) return;
+      const raw = Number(this.bpmInput.value);
+      const value = Number.isFinite(raw) ? Math.max(60, Math.min(180, Math.round(raw))) : null;
+      this.closeBpmEditor();
+      if (value !== null) this.onBpmValue?.(value);
+    };
+    this.bpmInput.addEventListener('blur', commit);
+    this.bpmInput.addEventListener('change', commit);
+    this.bpmInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commit();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        this.closeBpmEditor();
+      }
+    });
+  }
+
+  private openBpmEditor(): void {
+    this.bpmInput.value = this.bpmEl.textContent ?? '';
+    this.bpmInput.hidden = false;
+    this.bpmEl.hidden = true;
+    this.bpmInput.focus();
+    this.bpmInput.select();
+  }
+
+  private closeBpmEditor(): void {
+    if (this.bpmInput.hidden) return;
+    this.bpmInput.hidden = true;
+    this.bpmEl.hidden = false;
+  }
+
+  // ---------------------------------------------------------------- 弹出菜单
+
+  private bindMenus(): void {
+    this.viewMenuBtn.addEventListener('click', () => this.toggleMenu(this.viewMenu, this.viewMenuBtn));
+    this.moreBtn.addEventListener('click', () => this.toggleMenu(this.moreMenu, this.moreBtn));
+    this.viewFit.addEventListener('click', () => {
+      this.closeMenus();
+      this.onFitStage?.();
+    });
+    document.addEventListener(
+      'pointerdown',
+      (e) => {
+        if (!this.openMenu) return;
+        const target = e.target as Node | null;
+        if (target && (this.openMenu.contains(target) || this.menuTrigger?.contains(target))) return;
+        this.closeMenus();
+      },
+      true,
+    );
+    document.addEventListener(
+      'keydown',
+      (e) => {
+        if (!this.openMenu) return;
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          this.closeMenus(true);
+        }
+      },
+      true,
+    );
+  }
+
+  private toggleMenu(menu: HTMLElement, trigger: HTMLElement): void {
+    if (this.openMenu === menu) {
+      this.closeMenus(true);
+      return;
+    }
+    this.closeMenus(false);
+    this.openMenu = menu;
+    this.menuTrigger = trigger;
+    menu.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    const first = menu.querySelector<HTMLButtonElement>('button:not(:disabled)');
+    first?.focus();
+  }
+
+  closeMenus(refocus = false): void {
+    if (!this.openMenu) return;
+    const trigger = this.menuTrigger;
+    this.openMenu.hidden = true;
+    trigger?.setAttribute('aria-expanded', 'false');
+    this.openMenu = null;
+    this.menuTrigger = null;
+    if (refocus) trigger?.focus();
+  }
+
+  private runMore(action: string): void {
+    this.closeMenus();
+    if (action === 'examples') this.onExamples?.();
+    else if (action === 'infinite') this.onInfinite?.();
+    else if (action === 'share') this.onShare?.();
+    else if (action === 'help') this.onHelp?.();
+    else if (action === 'clear') this.onClear?.();
+  }
+
+  // ---------------------------------------------------------------- 弧线 / 进度
 
   private railStep(clientX: number): number {
     const rect = this.rail.getBoundingClientRect();
@@ -180,6 +403,8 @@ export class Hud {
     });
   }
 
+  // ---------------------------------------------------------------- 状态
+
   setPlaying(playing: boolean): void {
     document.body.classList.toggle('is-playing', playing);
     if (playing) this.atEnd = false;
@@ -207,8 +432,24 @@ export class Hud {
     this.examplesBtn.setAttribute('aria-label', open ? '关闭示例' : '示例');
   }
 
+  setHelpOpen(open: boolean): void {
+    this.helpBtn.classList.toggle('is-on', open);
+    this.helpBtn.setAttribute('aria-expanded', String(open));
+    this.helpBtn.setAttribute('aria-label', open ? '关闭玩法' : '玩法');
+  }
+
+  setHistory(canUndo: boolean, canRedo: boolean): void {
+    this.undoBtn.disabled = !canUndo;
+    this.redoBtn.disabled = !canRedo;
+    this.undoBtn.setAttribute('aria-disabled', String(!canUndo));
+    this.redoBtn.setAttribute('aria-disabled', String(!canRedo));
+  }
+
   setBpm(bpm: number): void {
     this.bpmEl.textContent = String(bpm);
+    if (!this.bpmInput.hidden && document.activeElement !== this.bpmInput) {
+      this.bpmInput.value = String(bpm);
+    }
   }
 
   setView(id: ViewId): void {
@@ -216,6 +457,7 @@ export class Hud {
       const active = btn.dataset.view === id;
       btn.classList.toggle('active', active);
       btn.setAttribute('aria-pressed', String(active));
+      if (btn.getAttribute('role') === 'menuitemradio') btn.setAttribute('aria-checked', String(active));
     }
   }
 
@@ -224,6 +466,8 @@ export class Hud {
     this.infiniteBtn.classList.toggle('is-on', on);
     this.infiniteBtn.setAttribute('aria-pressed', String(on));
     this.infiniteBtn.setAttribute('aria-label', on ? '退出无限模式' : '进入无限模式');
+    this.moreInfinite.setAttribute('aria-pressed', String(on));
+    this.moreInfinite.textContent = on ? '无限模式 · 开' : '无限模式';
   }
 
   /** 每步时长（秒）：由 main 在 BPM / 曲长变化时传入 */
@@ -306,35 +550,182 @@ export class Hud {
   setEmpty(empty: boolean): void {
     this.clearBtn.disabled = empty;
     this.clearBtn.setAttribute('aria-label', empty ? '舞台已经是空的' : '清空舞台');
+    this.moreClear.disabled = empty;
+    this.emptyHint.hidden = !empty;
   }
 
-  showToast(text: string, actionLabel: string | null, onAction: (() => void) | null, ttl = 5200): void {
-    this.toastText.textContent = text;
-    this.toastHandler = onAction;
-    this.toastEl.classList.toggle('has-action', !!actionLabel);
-    this.toastAction.hidden = !actionLabel;
-    if (actionLabel) this.toastAction.textContent = actionLabel;
-    this.toastEl.hidden = false;
-    requestAnimationFrame(() => this.toastEl.classList.add('in'));
-    window.clearTimeout(this.toastTimer);
-    this.toastTimer = window.setTimeout(() => this.hideToast(), ttl);
-  }
-
-  hideToast(): void {
-    window.clearTimeout(this.toastTimer);
-    this.toastHandler = null;
-    this.toastEl.classList.remove('in');
-    window.setTimeout(() => {
-      if (!this.toastEl.classList.contains('in')) this.toastEl.hidden = true;
-    }, 200);
+  /** 保存状态：失败时常驻一条低干扰提示，点击重试 */
+  setSaveStatus(status: SaveStatus, text: string, retryable = false): void {
+    const failed = status === 'failed';
+    this.saveStatus.hidden = !failed;
+    this.saveStatus.classList.toggle('is-failed', failed);
+    this.saveStatusText.textContent = failed
+      ? `${text}${retryable ? ' · 点击重试' : ''}`
+      : text;
+    this.saveStatus.setAttribute('aria-label', failed ? `${text}，点击重试保存` : text);
   }
 
   dismissHint(): void {
     if (this.hintGone) return;
     this.hintGone = true;
     this.hintEl.classList.add('gone');
+    this.hintEl.setAttribute('aria-hidden', 'true');
+    this.onHintDismiss?.();
+  }
+
+  // ---------------------------------------------------------------- 反馈
+
+  showToast(
+    text: string,
+    actionLabel: string | null,
+    onAction: (() => void) | null,
+    ttl = 5200,
+    focusAction = false,
+  ): void {
+    this.showFeedback('page', text, actionLabel, onAction, ttl, focusAction);
+  }
+
+  showDrawerFeedback(
+    which: Exclude<FeedbackTarget, 'page'>,
+    text: string,
+    actionLabel: string | null,
+    onAction: (() => void) | null,
+    ttl = 5200,
+    focusAction = false,
+  ): void {
+    this.showFeedback(which, text, actionLabel, onAction, ttl, focusAction);
+  }
+
+  private showFeedback(
+    target: FeedbackTarget,
+    text: string,
+    actionLabel: string | null,
+    onAction: (() => void) | null,
+    ttl: number,
+    focusAction = false,
+  ): void {
+    this.clearFeedbackSlots();
+    const slot = this.slots[target];
+    this.feedback = {
+      target,
+      text,
+      actionLabel,
+      handler: onAction,
+      ttl,
+      remaining: ttl,
+      startedAt: performance.now(),
+      timer: 0,
+      paused: false,
+    };
+    slot.text.textContent = text;
+    slot.action.hidden = !actionLabel;
+    if (actionLabel) slot.action.textContent = actionLabel;
+    slot.root.hidden = false;
+    slot.root.classList.toggle('has-action', !!actionLabel);
+    requestAnimationFrame(() => slot.root.classList.add('in'));
+    this.scheduleFeedback(ttl);
+    if (focusAction && actionLabel) {
+      requestAnimationFrame(() => {
+        if (this.feedback?.target === target) slot.action.focus();
+      });
+    }
+  }
+
+  private scheduleFeedback(ms: number): void {
+    const active = this.feedback;
+    if (!active) return;
+    window.clearTimeout(active.timer);
+    active.startedAt = performance.now();
+    active.remaining = ms;
+    active.timer = window.setTimeout(() => this.hideFeedback(), Math.max(0, ms));
+  }
+
+  private pauseFeedback(): void {
+    const active = this.feedback;
+    if (!active || active.paused) return;
+    active.paused = true;
+    window.clearTimeout(active.timer);
+    active.remaining = Math.max(0, active.remaining - (performance.now() - active.startedAt));
+  }
+
+  private resumeFeedback(): void {
+    const active = this.feedback;
+    if (!active || !active.paused) return;
+    active.paused = false;
+    this.scheduleFeedback(active.remaining);
+  }
+
+  private bindFeedback(slot: FeedbackSlot): void {
+    const isActive = (): boolean => this.feedback?.target === this.slotTarget(slot);
+    slot.root.addEventListener('pointerenter', () => {
+      if (isActive()) this.pauseFeedback();
+    });
+    slot.root.addEventListener('pointerleave', () => {
+      if (isActive()) this.resumeFeedback();
+    });
+    slot.root.addEventListener('focusin', () => {
+      if (isActive()) this.pauseFeedback();
+    });
+    slot.root.addEventListener('focusout', () => {
+      if (isActive()) this.resumeFeedback();
+    });
+    slot.action.addEventListener('click', () => {
+      const handler = this.feedback?.handler ?? null;
+      this.hideFeedback();
+      handler?.();
+    });
+  }
+
+  private slotTarget(slot: FeedbackSlot): FeedbackTarget {
+    if (slot === this.slots.settings) return 'settings';
+    if (slot === this.slots.examples) return 'examples';
+    return 'page';
+  }
+
+  /** 面板关闭：未过期反馈转交主页面，保留剩余时间和回调 */
+  transferFeedback(which: Exclude<FeedbackTarget, 'page'>): void {
+    const active = this.feedback;
+    if (!active || active.target !== which) return;
+    const remaining = active.paused
+      ? active.remaining
+      : Math.max(0, active.remaining - (performance.now() - active.startedAt));
+    if (remaining <= 0) {
+      this.hideFeedback();
+      return;
+    }
+    const handler = active.handler;
+    const label = active.actionLabel;
+    const text = active.text;
+    this.hideFeedback();
+    this.showFeedback('page', text, label, handler, remaining);
+  }
+
+  hideToast(): void {
+    this.hideFeedback();
+  }
+
+  /** 新编辑 / 撤销 / 重做后，旧提示的撤销回调已经指向另一次操作 */
+  hideFeedback(): void {
+    const active = this.feedback;
+    window.clearTimeout(active?.timer ?? 0);
+    this.feedback = null;
+    const hadFocus =
+      typeof document !== 'undefined' && !!document.activeElement &&
+      Object.values(this.slots).some((slot) => slot.root.contains(document.activeElement));
+    this.clearFeedbackSlots();
+    if (hadFocus) {
+      const canvas = document.querySelector<HTMLElement>('#scene');
+      canvas?.focus({ preventScroll: true });
+    }
+  }
+
+  private clearFeedbackSlots(): void {
+    for (const slot of Object.values(this.slots)) {
+      slot.root.classList.remove('in');
+      slot.root.hidden = true;
+      slot.action.hidden = true;
+    }
   }
 }
 
 const pad2 = (n: number): string => (n < 10 ? `0${n}` : String(n));
-
